@@ -1,0 +1,7 @@
+pandas
+numpy
+scikit-learn
+rapidfuzz
+lightgbm
+sentence-transformers
+torch

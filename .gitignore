@@ -1,0 +1,54 @@
+# ==========================================
+# Amazon ML Challenge 2026 - .gitignore
+# ==========================================
+
+# Large zip archives & downloads
+*.zip
+*.tar
+*.tar.gz
+*.7z
+6ab10eb3b23ba_student_resource*
+__MACOSX/
+.DS_Store
+
+# Competition datasets (multi-gigabyte TSVs)
+dataset/
+*.tsv
+*.csv
+data/
+
+# Model checkpoints & serialized weights
+models/
+*.pkl
+*.pickle
+*.pt
+*.pth
+*.bin
+*.onnx
+*.safetensors
+
+# Output submission files (keep folder if needed, ignore large TSV artifacts)
+output/*.tsv
+output/*.csv
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+# IDE and OS configurations
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
