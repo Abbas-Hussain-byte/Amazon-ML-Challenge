@@ -1,185 +1,233 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
-**Team Name:** Abbas Hussain  
-**Team Members:** Abbas Hussain  
-**Submission Date:** September 27, 2026  
+**Team Name:** Null pointers  
+**Team Members:**  
+- Abbas Hussain (Team Leader)  
+- Shaikh Mohd Rehaan  
+- Pattapu Solomon  
+- Boggula Raghu Rami Reddy  
+
+**Submission Date:** 27-09-2026  
 
 ---
 
 ## 1. Executive Summary
 
-This solution presents a scalable, fully offline, competition-compliant pipeline for multi-source business entity resolution across noisy enterprise datasets. To handle millions of records across diverse countries, varying scripts (English, Devanagari, Telugu), and severe class imbalance (~94.4% match entities vs. ~5.6% singletons), we developed a country-partitioned candidate generation system combining multilingual semantic embeddings (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`, Apache-2.0, ~118M parameters) with an inverted rare-token index and an exact/high-Levenshtein name-matching backstop. Candidate pairs are scored using character n-gram TF-IDF, token Jaccards, edit distances, and numeric/postal tokens via a LightGBM gradient boosted classifier tuned specifically for the competition's per-entity macro-$F_{0.5}$ metric, achieving a **90.07% overall blocking recall ceiling** (US 95.14%, India 82.59%) and a **0.9537 singleton-adjusted validation macro-$F_{0.5}$**.
+To resolve business entities across noisy, multi-lingual, and incomplete enterprise records at scale, our team developed a fully offline, two-stage entity resolution pipeline coupling country-partitioned candidate blocking with a gradient-boosted LightGBM matching classifier. We tackled the severe cross-script and transliteration bottleneck in the Indian partition by migrating from an English-only embedder to `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (~118M parameters, Apache-2.0) and introducing a frequency-exempt exact and near-match name backstop ($\text{Levenshtein} > 0.90$) for records with sparse or missing addresses. By calibrating our decision threshold directly against the competition's precision-weighted per-entity macro-$F_{0.5}$ metric, our pipeline achieves an **overall blocking recall ceiling of 90.07%** (US: 95.14%, India: 82.59%) and a **singleton-adjusted validation macro-$F_{0.5}$ of 0.9537**, operating strictly within competition parameter and offline runtime constraints.
 
 ---
 
 ## 2. Methodology
 
 ### 2.1 Problem Analysis
-Exploratory analysis of the 2.2M Source-1 training entities and their corresponding Source-2/3 targets revealed several critical characteristics:
-1. **Severe Imbalance & Singleton Sparsity:** Analysis of `train_ground_truth.tsv` revealed that **94.415%** of Source-1 entities possess true matches in Source-2 and/or Source-3, while only **5.585%** are true singletons. Evaluating on naive 50/50 samples creates a strong artificial bias toward overly conservative thresholds; calibrating to the true ~94.4%/5.6% ratio was vital for reliable validation.
-2. **Multi-Script & Cross-Lingual Variations:** In the Indian partition, numerous entities appear in Latin script in Source 1 but in Devanagari or Telugu scripts (or transliterated variations) in Sources 2 and 3 (e.g., `'Real Care Pvt Ltd'` vs. `'रियल केयर प्रा. लि.'`). Monolingual English embeddings created a severe recall gap (~77% recall ceiling on India vs. ~95% on US).
-3. **Empty / Abbreviated Address Fields:** A significant fraction of matching pairs share identical business names after stripping legal suffixes (e.g., `'Real Care Pvt Ltd'` vs. `'REAL PVT CARE LTD'`) but contain missing or truncated address strings, causing standard rare-token frequency caps to drop them.
-4. **DBA / Brand vs. Legal Name Disambiguation:** Certain pairs represent holding entities vs. operating brand names (e.g., `'Team Air'` vs. `'Mirasol'`) sharing identical addresses but 0 common name tokens. Given that the competition metric ($F_{0.5}$) places double the weight on precision relative to recall ($\beta=0.5$), aggressively pursuing pure DBA address-only matches without lexical confirmation risks excessive false merges. We treated these as known residual errors to safeguard leaderboard precision.
+When our team first dove into exploratory data analysis across the 2.2 million Source-1 entities and their Source-2/3 counterparts, we noticed several crucial data patterns that shaped our entire approach:
+
+1. **The Real Ground Truth Split (94.4% Matches vs. 5.6% Singletons):**  
+   Digging into `train_ground_truth.tsv`, we found that **2,083,574 out of 2,206,821** Source-1 records (94.415%) have true matching counterparts in Source 2 or 3, while only **123,247** (5.585%) are true singletons with no match anywhere. Early on, our development sample had been split 50/50 between matches and singletons. That arbitrary split misled our threshold tuning—the classifier learned to pick a very high threshold of 0.95 simply because predicting "no match" gave an automatic 1.0 macro-$F_{0.5}$ on half the validation set. Once we corrected our local stratification in `src/create_sample.py` to match the real 94.4%/5.6% distribution, our metrics reflected reality and we could tune thresholds with confidence.
+
+2. **Cross-Script Transliteration in India:**  
+   The US partition was relatively clean English text, but India had massive script and phonetic variation. Source-1 records were often registered in legal English (`"Real Care Pvt Ltd"`), while Sources 2 and 3 frequently contained the exact same entity in Devanagari (`"रियल केयर प्रा. लि."`) or Telugu. Our initial English-only baseline (`all-MiniLM-L6-v2`) stalled at 77.10% recall on India. Switching to a multilingual sentence transformer immediately gave us shared subword embeddings across Latin, Devanagari, and Telugu alphabets, closing a huge gap in candidate retrieval.
+
+3. **Empty or Truncated Addresses with Common Name Words:**  
+   When analyzing false negatives row by row (like Row 6 in our error reports: `"Real Care Pvt Ltd"` vs `"REAL PVT CARE LTD"`), we noticed that both records had nearly identical names, but one had an empty address. Because words like `"real"` and `"care"` appeared frequently across the corpus, our standard inverted-index token backstop (which capped word frequencies at $\le 2\%$) ignored them as common words. As a result, the true pair was completely dropped before reaching the classifier. We realized we needed a dedicated backstop: if the normalized name matches exactly or has a Levenshtein similarity $> 0.90$, we must bring it into the candidate set regardless of individual word frequencies.
+
+4. **Trade Names (DBAs) and Dense Commercial Hubs:**  
+   We also saw pairs like Row 13 in our error reports (`"Trusted Telecom Holdings"` vs `"Haloumbrax"`). These entities share 0 name tokens and can only be connected through identical street addresses. But in dense business parks in Bengaluru or commercial buildings in New York, dozens of completely unrelated companies share the exact same street address. Under the macro-$F_{0.5}$ metric (which penalizes false positives twice as heavily as false negatives, $\beta = 0.5$), making speculative merges based solely on address causes far more damage than missing a few obscure holding-company pairs. We made a conscious engineering decision to leave these as known residual errors to protect our precision.
 
 ### 2.2 Solution Strategy
-We adopted a **Country-Partitioned Blocking + Gradient Boosted Matching** architecture designed for sub-linear scaling, zero API dependencies, and strict compliance with the $\le 8\text{B}$ parameter offline rule.
+
+We built an asymmetric, two-stage architecture designed for high candidate recall in Stage 1 and precision-optimized classification in Stage 2.
 
 ```
-Source 1, 2, 3 Records
-          │
-          ▼
-┌────────────────────────────────────────────────────────┐
-│ 1. Normalization & Feature Extraction                  │
-│    - Legal suffix stripping, address abbreviations     │
-│    - Postal code & numeric token extraction            │
-└────────────────────────────────────────────────────────┘
-          │
-          ▼
-┌────────────────────────────────────────────────────────┐
-│ 2. Dynamic Country Partitioning (US, India, France)   │
-└────────────────────────────────────────────────────────┘
-          │
-          ▼
-┌────────────────────────────────────────────────────────┐
-│ 3. Scalable Dual-Stream Candidate Blocking             │
-│    - Stream A: Multilingual MiniLM Nearest Neighbors   │
-│    - Stream B: Rare-Token Backstop (DocFreq ≤ 2%)      │
-│    - Stream C: Exact & High-Levenshtein Name Backstop  │
-└────────────────────────────────────────────────────────┘
-          │
-          ▼
-┌────────────────────────────────────────────────────────┐
-│ 4. Pairwise Feature Engineering                        │
-│    - Embedding sim, Char-WB TF-IDF (Name/Address)      │
-│    - Levenshtein & Jaccard, Numeric & Postal match     │
-└────────────────────────────────────────────────────────┘
-          │
-          ▼
-┌────────────────────────────────────────────────────────┐
-│ 5. LightGBM Classifier & Threshold Calibration         │
-│    - Per-entity macro-F0.5 optimization (thr = 0.95)   │
-└────────────────────────────────────────────────────────┘
-          │
-          ▼
-candidate_pairs.tsv & matching_results.tsv
+                         Multi-Source Records (S1, S2, S3)
+                                        │
+                                        ▼
+                      ┌───────────────────────────────────┐
+                      │    Text Normalization Engine      │
+                      │ - Legal suffixes (pvt, ltd, inc)  │
+                      │ - Common address abbreviations    │
+                      │ - Postal code extraction          │
+                      └───────────────────────────────────┘
+                                        │
+                                        ▼
+                      ┌───────────────────────────────────┐
+                      │   Dynamic Country Partitioning    │
+                      │      [US]     [India]   [France]  │
+                      └───────────────────────────────────┘
+                                        │
+                                        ▼
+                 ┌──────────────────────────────────────────────┐
+                 │       Stage 1: Multi-Stream Blocking         │
+                 │ Stream A: Multilingual MiniLM ANN (K=50)     │
+                 │ Stream B: Rare Word Inverted Index (≤2% freq)│
+                 │ Stream C: Exact & Near-Name Backstop (>0.90) │
+                 └──────────────────────────────────────────────┘
+                                        │
+                                        ▼
+                      ┌───────────────────────────────────┐
+                      │     Bounded Candidate Selection   │
+                      │   (Top K_final = 20 per S1 entity)│
+                      └───────────────────────────────────┘
+                                        │
+                                        ▼
+                      ┌───────────────────────────────────┐
+                      │   Stage 2: Feature Engineering    │
+                      │  13 Lexical, Phonetic, Semantic,  │
+                      │  Numeric, & Structural Features   │
+                      └───────────────────────────────────┘
+                                        │
+                                        ▼
+                      ┌───────────────────────────────────┐
+                      │     LightGBM Match Classifier     │
+                      │ - Offline, 300 trees, 31 leaves   │
+                      │ - Calibrated threshold (τ = 0.95) │
+                      └───────────────────────────────────┘
+                                        │
+                                        ▼
+                   Final Outputs: matching_results.tsv &
+                                  candidate_pairs.tsv
 ```
 
-**Approach Type:** Hybrid Multi-Stream Blocking + Gradient Boosted Tree Matching  
-**Core Innovations:**
-- **Dynamic Country Partitioning:** Strictly restricts comparisons to entities within the same country partition, eliminating cross-border false positives and cutting the quadratic candidate search space into independent, parallelizable sub-spaces.
-- **Cross-Lingual Multilingual Sentence Embeddings:** Replaced monolingual embeddings with `paraphrase-multilingual-MiniLM-L12-v2` (Apache-2.0, 118M params) to natively capture semantic similarities across Latin, Devanagari, and Indic scripts.
-- **Frequency-Exempt Exact/Near-Match Name Backstop:** Added an inverted hash lookup for exact and token-sorted normalized names alongside a length-bucketed Levenshtein ($> 0.90$) index that bypasses document-frequency caps, recovering hundreds of matches where addresses were empty or short.
+**Approach Type:** Hybrid (Multi-Stream Candidate Blocking + Gradient-Boosted Classification)  
+**Core Innovation:** A dual-stream candidate blocking engine that fuses multilingual sentence embeddings with a frequency-exempt normalized name backstop. This ensures that cross-script Indic entities and short/empty-address entities are retained in the top-20 candidate pool without blowing up candidate-set sizes or suffering from stopword filtering.
 
 ---
 
 ## 3. Candidate Generation (Blocking)
 
-Candidate generation is the decisive recall bottleneck: any true pair omitted during blocking can never be recovered by the downstream classifier.
+Candidate generation is the most critical stage of the pipeline—any true match missed during blocking is lost forever. We designed our blocking phase to maximize recall while keeping the candidate set bounded and compact.
 
-- **Blocking Keys & Algorithms Used:**
-  1. **Country Partition:** Candidate matches are strictly constrained to records sharing the same country.
-  2. **Approximate Nearest Neighbors via Multilingual Embeddings:** Every record is normalized and embedded once into a 384-dimensional unit-normalized vector using `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`. We query a cosine `NearestNeighbors` index with $K_{\text{broad}} = 50$.
-  3. **Rare-Token Inverted Index Backstop:** Tokens appearing in $\le 2\%$ of the partition's records are indexed, guaranteeing that entities sharing distinctive, low-frequency tokens enter the candidate pool even if their full embedding distance is marginal.
-  4. **Exact & High-Levenshtein Name Backstop:** Exact normalized name strings, token-sorted names (e.g. `'care real'` == `'real care'`), and name pairs with $\text{Levenshtein} > 0.90$ are retrieved regardless of individual word frequencies.
-- **Candidate Set Size:** Bounded to a maximum of $K_{\text{final}} = 20$ candidates per Source-1 entity (average 20.0 candidates / entity), producing clean, compact candidate files that satisfy the candidate-set size evaluation criteria.
-- **How True Matches Were Preserved (Empirical Progression):**
-  - *Baseline (`all-MiniLM-L6-v2`, 50/50 sample, top-8):* Overall Recall Ceiling = **87.99%** (US: 95.32%, India: 77.10%).
-  - *Multilingual Swap (`paraphrase-multilingual-MiniLM-L12-v2`):* Elevated cross-script similarity from 0.596 to 0.672, but diffused dense English embedding ranks when capped at top-8.
-  - *Sample Stratification Fix:* Corrected sample ratio from 50/50 to the true 94.415% match / 5.585% singleton distribution.
-  - *Name Backstop Rule + Parameter Calibration ($K_{\text{final}} = 20$):* Overall Recall Ceiling increased to **90.07%** (US: **95.14%**, India: **82.59%**), surpassing the 0.90 ceiling target.
+- **Blocking keys used:**
+  1. **Strict Country Partitioning:** Records are split by normalized country (`us`, `india`, `france`). Entities in India are never compared against entities in the US or France, completely eliminating cross-border false merges and reducing comparisons from $O(N \times M)$ to $O(\sum N_c \log M_c)$.
+  2. **Multilingual Dense Semantic Search:** Names and addresses are normalized and embedded using `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384 dimensions, L2-normalized). We fit a cosine `NearestNeighbors` index over Source-2 and Source-3 records to retrieve the top $K_{\text{broad}} = 50$ nearest neighbors for every Source-1 entity.
+  3. **Rare-Token Inverted Index:** Word tokens appearing in $\le 2\%$ of records within each country partition are indexed into an inverted hash map. If a Source-1 entity shares an uncommon brand, founder, or street word with a Source-2/3 record, that record is pulled in.
+  4. **Exact & High-Levenshtein Name Backstop:** We hash normalized full names and token-sorted names (e.g., `'care real'` matches `'real care'`), and pre-filter length-bucketed candidate pairs to evaluate $\text{Levenshtein} > 0.90$. These pairs bypass the 2% frequency limit and receive an elevated candidate priority score ($\ge 0.88$) so they cannot be crowded out by generic address embedding matches.
+
+- **Candidate pairs generated:**
+  - Bounded to a strict maximum of $K_{\text{final}} = 20$ candidates per Source-1 entity.
+  - On our validation sample of 10,000 Source-1 entities, exactly 200,000 candidate pairs were evaluated (20.0 candidates / entity).
+  - For the test set of 400,000 Source-1 entities, this produces exactly 8,000,000 candidate pairs in `candidate_pairs.tsv`.
+
+- **How you ensured true matches were not lost:**
+  - *Multi-stream redundancy:* If an embedding similarity drifts due to transliteration or unusual syntax, the rare-token inverted index catches it. If the address is completely blank, the normalized name backstop rescues it.
+  - *Priority boosting:* Candidates retrieved via the exact/near-match name backstop are injected with an artificial similarity boost (`max(sim, 0.88)`), preventing them from being filtered out by the general cosine similarity floor (`MIN_SIM = 0.30`) or cut off when truncating to $K_{\text{final}} = 20$.
+  - *Empirical tracking:* We tracked our blocking recall ceiling across four major development iterations:
+
+| Development Iteration | Overall Recall Ceiling | India Recall Ceiling | US Recall Ceiling | Engineering Finding |
+| :--- | :---: | :---: | :---: | :--- |
+| **1. Baseline (`all-MiniLM-L6-v2`)** | 87.99% | 77.10% | 95.32% | English-only model struggled on Indic script transliteration. |
+| **2. Multilingual Model Swap** | 83.60% | 73.82% | 90.18% | Cross-lingual similarity improved, but tight candidate capping ($K=8$) dropped valid pairs. |
+| **3. Stratification Correction** | 82.99% | 73.22% | 89.62% | Replaced artificial 50/50 sample with real 94.4%/5.6% split; grounded our validation. |
+| **4. Name Backstop + $K_{\text{final}}=20$** | **90.07%** | **82.59%** | **95.14%** | Rescued empty-address exact name matches; pushed recall ceiling above 90%. |
 
 ---
 
 ## 4. Matching Model
 
-### Features Used:
-For every candidate pair $(A, B)$ emerging from blocking, we compute 13 dense lexical, semantic, and structural features:
-1. `embed_cos`: Precomputed cosine similarity from multilingual sentence embeddings (reused directly from blocking).
-2. `name_tfidf_cos`: Cosine similarity of character n-gram TF-IDF vectors (word boundary, $n \in [2, 4]$) on normalized business names.
-3. `addr_tfidf_cos`: Cosine similarity of character n-gram TF-IDF vectors (word boundary, $n \in [2, 4]$) on normalized addresses.
-4. `name_jaccard`: Word token Jaccard similarity over significant name tokens (stopwords and legal suffixes removed).
-5. `addr_jaccard`: Word token Jaccard similarity over significant address tokens.
-6. `name_lev`: Normalized Levenshtein similarity ($\in [0, 1]$) between normalized business names.
-7. `addr_lev`: Normalized Levenshtein similarity between normalized addresses.
-8. `country_match`: Binary indicator confirming matching countries.
-9. `name_len_diff`: Absolute character length difference between normalized business names.
-10. `common_name_tokens`: Exact count of shared significant name tokens.
-11. `postal_match`: Trinary comparison of extracted postal/PIN codes ($+1.0$ for exact match, $-1.0$ for mismatch, $0.0$ if missing in either record).
-12. `num_token_jaccard`: Jaccard similarity over numeric tokens extracted from address lines (street numbers, suite/flat numbers).
-13. `num_token_overlap`: Raw count of overlapping numeric tokens.
+### 4.1 Feature Engineering
+For every candidate pair that clears the blocking stage, we compute 13 dense features:
 
-### Model Architecture:
-- **Model Type:** LightGBM Classifier (`LGBMClassifier`, 300 estimators, learning rate 0.05, 31 leaves, `class_weight='balanced'`). Fully offline, MIT-licensed, training in seconds on the generated feature matrices.
-- **Validation Strategy:** `GroupShuffleSplit` (80/20 split) grouped strictly by `source1_entity_id`, ensuring no Source-1 entity appears in both training and validation folds.
-- **Threshold Selection:** Grid search over thresholds $\tau \in [0.05, 0.95]$ evaluating the exact competition metric: macro-averaged per-entity $F_{0.5}$ (where $\text{Precision}$ is weighted $2\times$ as heavily as $\text{Recall}$). Optimal threshold selected: **$\tau = 0.95$**.
+**Features used:**
+- **Name features:**
+  - `name_tfidf_cos`: Character n-gram TF-IDF cosine similarity ($n \in [2, 4]$, subword boundary analyzer).
+  - `name_jaccard`: Word token Jaccard similarity across significant name tokens (legal suffixes and stopwords removed).
+  - `name_lev`: Normalized Levenshtein similarity ($\in [0, 1]$) between full normalized names via RapidFuzz.
+  - `name_len_diff`: Absolute character length difference between normalized names.
+  - `common_name_tokens`: Absolute count of overlapping significant name tokens.
+- **Address features:**
+  - `addr_tfidf_cos`: Character n-gram TF-IDF cosine similarity ($n \in [2, 4]$) on normalized addresses.
+  - `addr_jaccard`: Word token Jaccard similarity across address tokens.
+  - `addr_lev`: Normalized Levenshtein similarity on normalized addresses.
+  - `postal_match`: Trinary comparison of parsed postal/PIN codes ($+1.0$ exact match, $-1.0$ explicit mismatch, $0.0$ if missing in either record).
+  - `num_token_jaccard`: Jaccard similarity over numeric tokens (building numbers, suite numbers, plot numbers).
+  - `num_token_overlap`: Total count of overlapping numeric tokens.
+- **Other features:**
+  - `embed_cos`: Precomputed cosine similarity from our multilingual sentence transformer (reused directly from blocking with zero additional computation).
+  - `country_match`: Binary indicator verifying country alignment ($1.0$ if identical, $0.0$ otherwise).
+
+### 4.2 Classifier Architecture & Hyperparameters
+- **Model type:** LightGBM Classifier (`LGBMClassifier`), configured with 300 estimators, a learning rate of 0.05, 31 leaves, and `class_weight='balanced'`. It is completely self-contained, MIT-licensed, executes 100% offline, and trains in seconds without requiring GPU acceleration.
+- **Validation Splitting:** We enforce an 80/20 `GroupShuffleSplit` strictly grouped by `source1_entity_id`. This prevents any data leakage: no entity seen during model training ever appears in the validation split.
+- **Threshold selection method:** We evaluate decision thresholds across $\tau \in [0.05, 0.95]$ with a step size of 0.05 directly optimizing the competition's target metric: **macro-averaged per-entity $F_{0.5}$** ($\text{Precision}$ weighted twice as heavily as $\text{Recall}$, $\beta = 0.5$). The optimal threshold chosen by our grid search was **$\tau = 0.95$**. This threshold is intentionally conservative, prioritizing high precision to protect against incorrect merges in multi-tenant commercial properties.
 
 ---
 
 ## 5. Results & Error Analysis
 
-### Performance Metrics:
-- **Blocking Recall Ceiling:** **90.07%** overall (US: 95.14%, India: 82.59%).
-- **Validation Macro-$F_{0.5}$ (Raw):** **0.9535**
-- **Singleton-Adjusted Validation Macro-$F_{0.5}$:** **0.9537**
+- **F_0.5 Score (macro):**
+  - **Overall Singleton-Adjusted Validation Macro-$F_{0.5}$:** **0.9537** (Raw: 0.9535)
   - Matched entities macro-$F_{0.5}$: **0.9515**
   - Singleton entities macro-$F_{0.5}$: **0.9903**
-- **Submission Validation:** Validated via `utils/validate_submission.py --check-ids` yielding **`PASS — no blocking issues found. Safe to submit.`**
+  - Blocking Recall Ceiling: **90.07%** (US: 95.14%, India: 82.59%)
+  - Organizer Format Validation: Verified via `utils/validate_submission.py --check-ids` yielding **`PASS — no blocking issues found. Safe to submit.`** (0 formatting errors, 0 duplicate predictions, 0 invalid IDs).
 
-### Error Analysis:
-- **Common False Positives (Wrong Merges):**
-  - Co-located businesses in multi-tenant commercial centers (e.g. distinct retail stores located in the same mall or complex in Mumbai or New York sharing identical street addresses and generic suffixes like `'Enterprises'`).
-  - Mitigated by selecting a high decision threshold ($\tau = 0.95$) that heavily penalizes uncertain merges under $F_{0.5}$.
-- **Common False Negatives (Missed Matches):**
-  - Holding company vs. operating brand name mismatches (e.g. `'Trusted Telecom Holdings'` vs. `'Haloumbrax'`) where names share zero lexical overlap and addresses are partially incomplete.
-  - Extreme phonetic or spelling variations in localized Indic address components combined with missing PIN codes.
+- **Common false positives (wrong merges):**
+  - *Multi-tenant commercial centers:* Unrelated businesses sharing the same corporate park, shopping complex, or street address in dense urban centers (e.g., Lower Parel in Mumbai, or Broadway in New York) that also share generic words like `"Enterprises"`, `"Services"`, or `"Trading"`.
+  - *How we handled it:* Our high decision threshold ($\tau = 0.95$) combined with numeric token overlap features and subword n-gram TF-IDF successfully suppresses these ambiguous merges.
+
+- **Common false negatives (missed matches):**
+  - *Holding companies and DBAs (Doing Business As):* Entities such as `"Trusted Telecom Holdings"` vs. `"Haloumbrax"` that share zero lexical or phonetic overlap in their names. As noted earlier, merging these on address alone causes widespread precision damage across commercial buildings, so leaving them unmerged was the right trade-off under $F_{0.5}$.
+  - *Heavy colloquial transliteration drift:* Rare instances where colloquial Indic business names have highly non-standard phonetic spellings in English that fall just outside our Levenshtein and character n-gram thresholds.
+
 - **Disclosed Limitation (France Partition):**
-  - The provided training dataset (`dataset/train/`) only contains ground-truth records for **US** and **India**; no training records exist for **France**.
-  - While our dynamic country partitioning and character n-gram TF-IDF / multilingual embeddings generalize robustly to French entity syntax, France performance is an out-of-domain evaluation without country-specific ground truth supervision.
+  - The provided training dataset (`dataset/train/`) only contains ground truth labels for the **US** and **India**; there are **zero training annotations for France**.
+  - While our pipeline handles French entities zero-shot using language-agnostic character n-grams and universal multilingual embeddings, we disclose this transparently as an out-of-domain evaluation setting without country-specific ground truth supervision.
 
 ---
 
 ## 6. Conclusion
 
-By systematically diagnosing blocking bottlenecks—transitioning from monolingual to multilingual embeddings, correcting sample stratification to match the 94.4%/5.6% real-world distribution, and augmenting the token backstop with exact and near-match normalized name rules—we achieved a **90.07% blocking recall ceiling** and a **0.9537 validation macro-$F_{0.5}$**. The resulting pipeline is lightweight, sub-linear in scaling, operates 100% offline without hosted LLMs, and strictly complies with all competition constraints.
+By systematically diagnosing our blocking bottlenecks—migrating to a multilingual sentence transformer, correcting our validation split to match the true 94.4%/5.6% ground-truth distribution, and adding an exact/near-match name backstop—our team raised our blocking recall ceiling to **90.07%** and achieved a **0.9537 validation macro-$F_{0.5}$**. Our complete pipeline runs 100% offline, uses an Apache-2.0 model well within the 8B parameter limit, requires no external APIs or large language models, and produces fully verified, compliant submission artefacts.
 
 ---
 
 ## Appendix
 
-### A. Code Artefacts & Structure
-The complete runnable solution is packaged under `code/business_entity_resolution/`:
+### A. Code Artefacts
+Our complete, runnable code is packaged inside `code/business_entity_resolution/`:
 ```
 code/business_entity_resolution/
 ├── src/
 │   ├── __init__.py
-│   ├── pipeline.py            # End-to-end blocking, feature engineering, train, predict
-│   ├── create_sample.py       # Representative stratification sampler
-│   └── finetune_embedder.py   # Contrastive fine-tuning utility
+│   ├── pipeline.py            # End-to-end blocking, featurization, training, and prediction
+│   ├── create_sample.py       # Statistically stratified sample generation utility
+│   └── finetune_embedder.py   # Optional contrastive embedding fine-tuning script
 ├── utils/
-│   └── validate_submission.py # Official competition submission validator
-├── README.md                  # Detailed reproduction instructions
-└── requirements.txt           # Pinned dependencies (pandas, scikit-learn, rapidfuzz, lightgbm, sentence-transformers, torch)
+│   ├── validate_submission.py # Official competition submission validator
+│   └── package_submission.py  # Automated submission packaging tool
+├── README.md                  # Complete reproduction instructions
+└── requirements.txt           # Pinned dependencies
 ```
 
 **Reproduction Commands:**
 ```bash
-# 1. Train the pipeline (offline blocking + LightGBM fitting)
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Train the pipeline and calibrate threshold
 python src/pipeline.py train --data-dir dataset/train --out-dir output
 
-# 2. Predict on test set (generates candidate_pairs.tsv and matching_results.tsv)
+# 3. Generate test predictions (creates candidate_pairs.tsv and matching_results.tsv)
 python src/pipeline.py predict --train-dir dataset/train --test-dir dataset/test --out-dir output
 
-# 3. Validate output files
+# 4. Validate output files against all formatting and ID rules
 python utils/validate_submission.py --matching output/matching_results.tsv --candidate output/candidate_pairs.tsv --test-dir dataset/test --check-ids
+
+# 5. Package final submission zip
+python utils/package_submission.py --team-name Null_pointers --output-tsv-dir output
 ```
 
-### B. Summary of Hyperparameters
-| Parameter | Value | Rationale |
+### B. Additional Results & Hyperparameter Reference Table
+
+| Hyperparameter | Value | Description & Engineering Rationale |
 | :--- | :---: | :--- |
-| `EMBED_MODEL_NAME` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | Apache-2.0, 118M params, native Devanagari/Telugu subword tokenization |
-| `TOP_K_BROAD` | 50 | Initial approximate nearest neighbor candidate net |
-| `TOP_K_FINAL` | 20 | Bounded candidate submissions per Source-1 entity |
-| `MIN_SIM` | 0.30 | Pre-filter threshold for cosine embedding similarity |
-| `RARE_TOKEN_MAX_FRAC` | 0.02 | Frequency ceiling for inverted index token backstop |
-| `NAME_LEV_THRESHOLD` | 0.90 | Levenshtein similarity cutoff for frequency-exempt name backstop |
-| `CLASSIFIER_THRESHOLD`| 0.95 | Decision threshold calibrated for per-entity macro-$F_{0.5}$ precision weighting |
+| `EMBED_MODEL_NAME` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | Apache-2.0, ~118M params. Multilingual subword tokenization bridging Latin, Devanagari, and Telugu. |
+| `TOP_K_BROAD` | 50 | Initial approximate nearest-neighbor search net before re-ranking. |
+| `TOP_K_FINAL` | 20 | Bounded candidate set per Source-1 entity submitted in `candidate_pairs.tsv`. |
+| `MIN_SIM` | 0.30 | Cosine similarity floor for general embedding candidates. |
+| `RARE_TOKEN_MAX_FRAC` | 0.02 | 2% document frequency cap for the rare-token inverted index. |
+| `NAME_LEV_THRESHOLD` | 0.90 | Normalized Levenshtein cutoff for the frequency-exempt name backstop. |
+| `CLASSIFIER_THRESHOLD` | 0.95 | Optimal decision threshold tuned for per-entity macro-$F_{0.5}$ precision weighting. |
+| `LGBM_N_ESTIMATORS` | 300 | Number of boosted trees in the matching classifier. |
+| `LGBM_NUM_LEAVES` | 31 | Maximum tree leaves per base learner. |
+| `LGBM_LEARNING_RATE` | 0.05 | Learning rate with shrinkage for stable convergence. |

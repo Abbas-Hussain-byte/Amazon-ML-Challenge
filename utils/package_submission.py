@@ -81,7 +81,7 @@ def create_submission_zip(team_name: str, root_dir: Path, output_tsv_dir: Path, 
 
 def main():
     ap = argparse.ArgumentParser(description="Package Amazon ML Challenge 2026 submission zip")
-    ap.add_argument("--team-name", type=str, default="Abbas_Hussain", help="Team name prefix")
+    ap.add_argument("--team-name", type=str, default="Null_pointers", help="Team name prefix")
     ap.add_argument("--root-dir", type=Path, default=Path("."), help="Project root directory")
     ap.add_argument("--output-tsv-dir", type=Path, default=Path("output/sample_final"), help="Directory containing matching_results.tsv and candidate_pairs.tsv")
     ap.add_argument("--zip-dest-dir", type=Path, default=Path("output"), help="Destination directory for the zip file")
