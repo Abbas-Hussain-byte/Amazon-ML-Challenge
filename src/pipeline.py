@@ -156,15 +156,29 @@ def extract_numeric_tokens(text: str) -> set:
 
 def load_and_normalize(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
-    df["country_norm"] = df["country"].astype(str).str.strip().str.lower()
-    df["norm_name"] = df["business_name"].apply(normalize_name)
-    df["norm_addr"] = df["business_address"].apply(normalize_address)
-    df["name_tokens"] = df["norm_name"].apply(significant_tokens)
-    df["addr_tokens"] = df["norm_addr"].apply(significant_tokens)
-    df["postal_code"] = [extract_postal_code(a, c) for a, c in zip(df["business_address"], df["country_norm"])]
-    df["num_tokens"] = df["business_address"].apply(extract_numeric_tokens)
-    df["embed_text"] = (df["norm_name"] + " " + df["norm_addr"]).str.strip()
-    return df
+    country_norm = df["country"].astype(str).str.strip().str.lower()
+    norm_name = df["business_name"].apply(normalize_name)
+    norm_addr = df["business_address"].apply(normalize_address)
+    name_tokens = norm_name.apply(significant_tokens)
+    addr_tokens = norm_addr.apply(significant_tokens)
+    postal_code = [extract_postal_code(a, c) for a, c in zip(df["business_address"], country_norm)]
+    num_tokens = df["business_address"].apply(extract_numeric_tokens)
+    embed_text = (norm_name + " " + norm_addr).str.strip()
+
+    result = pd.DataFrame({
+        "entity_id": df["entity_id"].values,
+        "country_norm": country_norm.values,
+        "norm_name": norm_name.values,
+        "norm_addr": norm_addr.values,
+        "name_tokens": name_tokens.values,
+        "addr_tokens": addr_tokens.values,
+        "postal_code": postal_code,
+        "num_tokens": num_tokens.values,
+        "embed_text": embed_text.values
+    })
+    del df
+    gc.collect()
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -558,9 +572,11 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path):
     s1 = load_and_normalize(test_dir / "test_source1.tsv")
     s2 = load_and_normalize(test_dir / "test_source2.tsv")
     s3 = load_and_normalize(test_dir / "test_source3.tsv")
-    others = pd.concat([s2, s3], ignore_index=True)
     total_recs = len(s1) + len(s2) + len(s3)
-    print(f"Total test records processed: S1={len(s1)}, S2={len(s2)}, S3={len(s3)} (Total={total_recs:,})")
+    others = pd.concat([s2, s3], ignore_index=True)
+    del s2, s3
+    gc.collect()
+    print(f"Total test records processed: S1={len(s1)}, Others={len(others)} (Total={total_recs:,})")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     cand_map = defaultdict(list)
