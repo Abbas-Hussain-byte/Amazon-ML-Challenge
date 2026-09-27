@@ -86,9 +86,9 @@ except ImportError:
 EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 
-TOP_K_FINAL = 8          # final candidates per S1 entity (controls submitted set size)
-TOP_K_BROAD = 30         # broader recall net before re-ranking/trimming to TOP_K_FINAL
-MIN_SIM = 0.35            # drop candidates below this cosine similarity outright
+TOP_K_FINAL = 20         # final candidates per S1 entity (controls submitted set size)
+TOP_K_BROAD = 50         # broader recall net before re-ranking/trimming to TOP_K_FINAL
+MIN_SIM = 0.30           # drop candidates below this cosine similarity outright
 RARE_TOKEN_MAX_FRAC = 0.02   # skip tokens appearing in > 2% of records for token-blocking backstop
 
 
@@ -202,11 +202,14 @@ def encode(model, texts, batch_size=128):
 
 def rare_token_backstop(s1: pd.DataFrame, others: pd.DataFrame, max_frac=RARE_TOKEN_MAX_FRAC) -> dict:
     """
-    Token-overlap candidates, but ONLY using tokens rare enough to be useful
-    for blocking (skips generic words like 'store', 'restaurant' that would
-    otherwise create huge, low-value blocks). Pure recall backstop —
-    final size is still controlled downstream by the embedding re-ranking.
+    Token-overlap candidates, using:
+      1. Rare tokens (document frequency <= max_count) to catch distinctive word overlaps.
+      2. Full normalized name matches and near-matches (Levenshtein similarity > 0.9)
+         REGARDLESS of individual token document frequency, catching cases where names
+         contain common words (e.g. 'Real Care Pvt Ltd' vs 'REAL PVT CARE LTD') or
+         addresses are empty/short.
     """
+    # 1. Rare tokens inverted index
     doc_freq = Counter()
     for tokens in others["name_tokens"]:
         for tok in tokens:
@@ -220,11 +223,51 @@ def rare_token_backstop(s1: pd.DataFrame, others: pd.DataFrame, max_frac=RARE_TO
         for tok in tokens & useful_tokens:
             index[tok].add(eid)
 
-    result = defaultdict(set)
+    token_cands = defaultdict(set)
     for eid, tokens in zip(s1["entity_id"], s1["name_tokens"]):
         for tok in tokens:
-            result[eid] |= index.get(tok, set())
-    return result
+            token_cands[eid] |= index.get(tok, set())
+
+    # 2. Full normalized name match & Levenshtein > 0.9 backstop rule (regardless of token frequency)
+    exact_name_index = defaultdict(set)
+    sorted_tok_index = defaultdict(set)
+    cand_index = defaultdict(list)
+    for eid, name, tokens in zip(others["entity_id"], others["norm_name"], others["name_tokens"]):
+        if len(name) >= 3:
+            exact_name_index[name].add(eid)
+            cand_index[name[:3]].append((eid, name, len(name)))
+            st = " ".join(sorted(tokens))
+            if st:
+                sorted_tok_index[st].add(eid)
+            for tok in tokens:
+                cand_index[tok].append((eid, name, len(name)))
+
+    name_cands = defaultdict(set)
+    for eid, name, tokens in zip(s1["entity_id"], s1["norm_name"], s1["name_tokens"]):
+        if len(name) >= 3:
+            name_cands[eid] |= exact_name_index.get(name, set())
+            st = " ".join(sorted(tokens))
+            if st:
+                name_cands[eid] |= sorted_tok_index.get(st, set())
+
+            l1 = len(name)
+            max_diff = max(1, int(0.12 * l1))
+            seen = set()
+            cands_to_check = []
+            for cid, c_name, l2 in cand_index.get(name[:3], []):
+                if cid not in seen and abs(l1 - l2) <= max_diff:
+                    seen.add(cid)
+                    cands_to_check.append((cid, c_name))
+            for tok in tokens:
+                for cid, c_name, l2 in cand_index.get(tok, []):
+                    if cid not in seen and abs(l1 - l2) <= max_diff:
+                        seen.add(cid)
+                        cands_to_check.append((cid, c_name))
+            for cid, c_name in cands_to_check:
+                if lev_ratio(name, c_name) > 0.9:
+                    name_cands[eid].add(cid)
+
+    return token_cands, name_cands
 
 
 def generate_candidates_partition(s1_part: pd.DataFrame, others_part: pd.DataFrame, embedder) -> list:
@@ -241,7 +284,7 @@ def generate_candidates_partition(s1_part: pd.DataFrame, others_part: pd.DataFra
     dist, idx = nn.kneighbors(s1_vecs)
     embed_sim = 1 - dist  # cosine distance -> similarity
 
-    token_backstop = rare_token_backstop(s1_part, others_part)
+    token_backstop, name_backstop = rare_token_backstop(s1_part, others_part)
     other_pos = {eid: i for i, eid in enumerate(other_ids)}
 
     rows = []
@@ -250,11 +293,16 @@ def generate_candidates_partition(s1_part: pd.DataFrame, others_part: pd.DataFra
         for j, sim in zip(idx[row_i], embed_sim[row_i]):
             cand_scores[other_ids[j]] = float(sim)
 
-        # backstop: add rare-token matches even if outside the embedding top-K_BROAD
+        # Standard rare-token backstop: add token overlaps using real dot product
         for cid in token_backstop.get(s1_id, set()):
             if cid not in cand_scores and cid in other_pos:
+                cand_scores[cid] = float(np.dot(s1_vecs[row_i], other_vecs[other_pos[cid]]))
+
+        # Name rule backstop: ensure exact and high-Levenshtein name matches are prioritized
+        for cid in name_backstop.get(s1_id, set()):
+            if cid in other_pos:
                 sim = float(np.dot(s1_vecs[row_i], other_vecs[other_pos[cid]]))
-                cand_scores[cid] = sim
+                cand_scores[cid] = max(cand_scores.get(cid, 0.0), sim, 0.88)
 
         ranked = sorted(cand_scores.items(), key=lambda x: -x[1])
         kept = [(cid, s) for cid, s in ranked if s >= MIN_SIM][:TOP_K_FINAL]
