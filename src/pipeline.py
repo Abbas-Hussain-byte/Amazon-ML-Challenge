@@ -90,6 +90,7 @@ TOP_K_FINAL = 20         # final candidates per S1 entity (controls submitted se
 TOP_K_BROAD = 50         # broader recall net before re-ranking/trimming to TOP_K_FINAL
 MIN_SIM = 0.30           # drop candidates below this cosine similarity outright
 RARE_TOKEN_MAX_FRAC = 0.02   # skip tokens appearing in > 2% of records for token-blocking backstop
+LARGE_PARTITION_THRESHOLD = 200_000  # Partitions with Others > this skip global ANN matrix to avoid OOM
 
 
 # --------------------------------------------------------------------------
@@ -679,28 +680,37 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path):
             gc.collect()
             continue
 
-        # 1. Build country-level indices ONCE per country (reused across batches)
-        print(f"  Encoding Others records into float16 (batch_size=64)...")
-        other_vecs = encode(embedder, others_c["embed_text"], batch_size=64)
-        other_ids = others_c["entity_id"].values
-        other_pos = {eid: i for i, eid in enumerate(other_ids)}
+        is_large = len(others_c) > LARGE_PARTITION_THRESHOLD
+        mode_str = "backstop-only" if is_large else "embedding+backstop"
+        print(f"  [Partition Mode: {mode_str}] Others count: {len(others_c):,} (LARGE_PARTITION_THRESHOLD: {LARGE_PARTITION_THRESHOLD:,})")
 
-        cur_ram = get_ram_gb()
-        peak_ram_gb = max(peak_ram_gb, cur_ram)
-        print(f"  Others embeddings ready! Shape: {other_vecs.shape}, dtype: {other_vecs.dtype} | RAM: {cur_ram:.2f} GB (Peak: {peak_ram_gb:.2f} GB)")
-
-        print(f"  Building NearestNeighbors index over Others (built ONCE per country)...")
-        k_broad = min(TOP_K_BROAD, len(other_ids))
-        nn = NearestNeighbors(n_neighbors=k_broad, metric="cosine").fit(other_vecs)
-
+        # Build backstop index over Others once per country
         print(f"  Building rare-token & name backstop index over Others...")
         backstop_data = build_others_backstop_index(others_c)
-
         cur_ram = get_ram_gb()
         peak_ram_gb = max(peak_ram_gb, cur_ram)
-        print(f"  Country index ready! RAM: {cur_ram:.2f} GB (Peak: {peak_ram_gb:.2f} GB)")
 
-        # 2. Sub-chunk S1 into batches of 1,500 entities
+        if not is_large:
+            # Mode A: embedding + backstop
+            print(f"  Encoding Others records into float16 (batch_size=64)...")
+            other_vecs = encode(embedder, others_c["embed_text"], batch_size=64)
+            other_ids = others_c["entity_id"].values
+            other_pos = {eid: i for i, eid in enumerate(other_ids)}
+            print(f"  Building NearestNeighbors index over Others...")
+            k_broad = min(TOP_K_BROAD, len(other_ids))
+            nn = NearestNeighbors(n_neighbors=k_broad, metric="cosine").fit(other_vecs)
+            cur_ram = get_ram_gb()
+            peak_ram_gb = max(peak_ram_gb, cur_ram)
+            print(f"  Country index ready! RAM: {cur_ram:.2f} GB (Peak: {peak_ram_gb:.2f} GB)")
+        else:
+            # Mode B: backstop-only (skip global embedding matrix)
+            print(f"  Bypassing global NearestNeighbors embedding matrix to keep RAM < 3 GB.")
+            other_text_dict = dict(zip(others_c["entity_id"].values, others_c["embed_text"].values))
+            cur_ram = get_ram_gb()
+            peak_ram_gb = max(peak_ram_gb, cur_ram)
+            print(f"  Country backstop index ready! RAM: {cur_ram:.2f} GB (Peak: {peak_ram_gb:.2f} GB)")
+
+        # Sub-chunk S1 into batches of 1,500 entities
         s1_batch_size = 1500
         n_batches = (len(s1_c) + s1_batch_size - 1) // s1_batch_size
         print(f"  Processing {len(s1_c):,} S1 entities in {n_batches} batches of {s1_batch_size}...")
@@ -713,52 +723,77 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path):
             b_end = min(b_start + s1_batch_size, len(s1_c))
             s1_batch = s1_c.iloc[b_start:b_end]
 
-            # Encode S1 batch in float16
-            s1_batch_vecs = encode(embedder, s1_batch["embed_text"], batch_size=64)
-            dist, idx = nn.kneighbors(s1_batch_vecs)
-            embed_sim = 1 - dist
-
             token_backstop, name_backstop = query_backstop_for_batch(s1_batch, backstop_data)
 
             rows = []
-            for row_i, s1_id in enumerate(s1_batch["entity_id"].values):
-                cand_scores = {}
-                for j, sim in zip(idx[row_i], embed_sim[row_i]):
-                    cand_scores[other_ids[j]] = float(sim)
+            if not is_large:
+                # Mode A: use pre-fitted nn
+                s1_batch_vecs = encode(embedder, s1_batch["embed_text"], batch_size=64)
+                dist, idx = nn.kneighbors(s1_batch_vecs)
+                embed_sim = 1 - dist
+                for row_i, s1_id in enumerate(s1_batch["entity_id"].values):
+                    cand_scores = {}
+                    for j, sim in zip(idx[row_i], embed_sim[row_i]):
+                        cand_scores[other_ids[j]] = float(sim)
+                    for cid in token_backstop.get(s1_id, set()):
+                        if cid not in cand_scores and cid in other_pos:
+                            cand_scores[cid] = float(np.dot(s1_batch_vecs[row_i], other_vecs[other_pos[cid]]))
+                    for cid in name_backstop.get(s1_id, set()):
+                        if cid in other_pos:
+                            sim = float(np.dot(s1_batch_vecs[row_i], other_vecs[other_pos[cid]]))
+                            cand_scores[cid] = max(cand_scores.get(cid, 0.0), sim, 0.88)
+                    ranked = sorted(cand_scores.items(), key=lambda x: -x[1])
+                    kept = [(cid, s) for cid, s in ranked if s >= MIN_SIM][:TOP_K_FINAL]
+                    for cid, sim in kept:
+                        rows.append((s1_id, cid, sim))
+                del s1_batch_vecs, dist, idx, embed_sim
+            else:
+                # Mode B: backstop-only, compute per-candidate dot products on the fly
+                batch_cids = {cid for cids in token_backstop.values() for cid in cids} | \
+                             {cid for cids in name_backstop.values() for cid in cids}
+                if batch_cids:
+                    s1_batch_vecs = encode(embedder, s1_batch["embed_text"], batch_size=64)
+                    cand_list = [cid for cid in batch_cids if cid in other_text_dict]
+                    cand_texts = [other_text_dict[cid] for cid in cand_list]
+                    cand_vecs = encode(embedder, cand_texts, batch_size=64)
+                    cand_vec_map = {cid: cand_vecs[i] for i, cid in enumerate(cand_list)}
 
-                for cid in token_backstop.get(s1_id, set()):
-                    if cid not in cand_scores and cid in other_pos:
-                        cand_scores[cid] = float(np.dot(s1_batch_vecs[row_i], other_vecs[other_pos[cid]]))
+                    for row_i, s1_id in enumerate(s1_batch["entity_id"].values):
+                        cand_scores = {}
+                        for cid in name_backstop.get(s1_id, set()):
+                            if cid in cand_vec_map:
+                                sim = float(np.dot(s1_batch_vecs[row_i], cand_vec_map[cid]))
+                                cand_scores[cid] = max(sim, 0.88)
+                        for cid in token_backstop.get(s1_id, set()):
+                            if cid not in cand_scores and cid in cand_vec_map:
+                                cand_scores[cid] = float(np.dot(s1_batch_vecs[row_i], cand_vec_map[cid]))
 
-                for cid in name_backstop.get(s1_id, set()):
-                    if cid in other_pos:
-                        sim = float(np.dot(s1_batch_vecs[row_i], other_vecs[other_pos[cid]]))
-                        cand_scores[cid] = max(cand_scores.get(cid, 0.0), sim, 0.88)
-
-                ranked = sorted(cand_scores.items(), key=lambda x: -x[1])
-                kept = [(cid, s) for cid, s in ranked if s >= MIN_SIM][:TOP_K_FINAL]
-                for cid, sim in kept:
-                    rows.append((s1_id, cid, sim))
+                        ranked = sorted(cand_scores.items(), key=lambda x: -x[1])
+                        kept = [(cid, s) for cid, s in ranked if s >= MIN_SIM][:TOP_K_FINAL]
+                        for cid, sim in kept:
+                            rows.append((s1_id, cid, sim))
+                    del s1_batch_vecs, cand_vecs, cand_vec_map
 
             part_cands += len(rows)
             total_candidates_count += len(rows)
 
-            # Build features for just this 1,500 entity batch
-            c_pairs = pd.DataFrame(rows, columns=["source1_entity_id", "candidate_entity_id", "embed_cos"])
-            del rows
-            c_feats = build_features(c_pairs, s1_batch, others_c, name_vec, addr_vec)
-            del c_pairs
-
-            # Predict probabilities
-            c_probs = model.predict_proba(c_feats[FEATURE_COLS])[:, 1] if len(c_feats) else np.array([])
             batch_cand_map = defaultdict(list)
-            for s1_id, cid in zip(c_feats["source1_entity_id"], c_feats["candidate_entity_id"]):
-                batch_cand_map[s1_id].append(cid)
-
             batch_match_map = defaultdict(list)
-            for s1_id, cid, p in zip(c_feats["source1_entity_id"], c_feats["candidate_entity_id"], c_probs):
-                if p >= threshold:
-                    batch_match_map[s1_id].append(cid)
+
+            if rows:
+                c_pairs = pd.DataFrame(rows, columns=["source1_entity_id", "candidate_entity_id", "embed_cos"])
+                del rows
+                c_feats = build_features(c_pairs, s1_batch, others_c, name_vec, addr_vec)
+                del c_pairs
+
+                for s1_id, cid in zip(c_feats["source1_entity_id"], c_feats["candidate_entity_id"]):
+                    batch_cand_map[s1_id].append(cid)
+
+                c_probs = model.predict_proba(c_feats[FEATURE_COLS])[:, 1] if len(c_feats) else np.array([])
+                for s1_id, cid, p in zip(c_feats["source1_entity_id"], c_feats["candidate_entity_id"], c_probs):
+                    if p >= threshold:
+                        batch_match_map[s1_id].append(cid)
+                del c_feats, c_probs
 
             # Write batch results directly and incrementally to disk
             with open(out_dir / "candidate_pairs.tsv", "a", encoding="utf-8") as f_cand, \
@@ -767,9 +802,7 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path):
                     f_cand.write(f"{eid}\t{','.join(dict.fromkeys(batch_cand_map.get(eid, [])))}\n")
                     f_match.write(f"{eid}\t{','.join(dict.fromkeys(batch_match_map.get(eid, [])))}\n")
 
-            # Free batch intermediate data immediately
-            del s1_batch_vecs, dist, idx, embed_sim, token_backstop, name_backstop
-            del c_feats, c_probs, batch_cand_map, batch_match_map
+            del token_backstop, name_backstop, batch_cand_map, batch_match_map
             gc.collect()
 
             cur_ram = get_ram_gb()
@@ -781,7 +814,11 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path):
                 print(f"  [Batch {b_idx + 1}/{n_batches}] Processed {b_end:,}/{len(s1_c):,} S1 entities ({rate:.0f} ent/s) | RAM: {cur_ram:.2f} GB | Peak RAM: {peak_ram_gb:.2f} GB")
 
         print(f"  Finished [{c_label}]! Generated {part_cands:,} candidate pairs. Freeing partition memory...")
-        del s1_c, others_c, other_vecs, other_ids, other_pos, nn, backstop_data
+        if not is_large:
+            del other_vecs, other_ids, other_pos, nn
+        else:
+            del other_text_dict
+        del s1_c, others_c, backstop_data
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
