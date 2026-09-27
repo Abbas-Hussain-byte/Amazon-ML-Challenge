@@ -43,11 +43,13 @@ requirements.txt:
 import argparse
 import re
 import pickle
+import gc
 from pathlib import Path
 from collections import defaultdict, Counter
 
 import numpy as np
 import pandas as pd
+import torch
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.neighbors import NearestNeighbors
 from sklearn.model_selection import GroupShuffleSplit
@@ -79,10 +81,10 @@ except ImportError:
 # Config
 # --------------------------------------------------------------------------
 
-# Apache-2.0, 22M params, well under the 8B cap. Runs fully offline after the
-# first download. Swap for 'paraphrase-multilingual-MiniLM-L12-v2' (also
-# Apache-2.0, ~118M params) if you see many non-Latin-script names.
-EMBED_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+# Apache-2.0, ~118M params, well under the 8B cap. Runs fully offline after the
+# first download. High subword coverage for non-Latin and Indian scripts (Devanagari, Telugu, etc.).
+EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
 
 TOP_K_FINAL = 8          # final candidates per S1 entity (controls submitted set size)
 TOP_K_BROAD = 30         # broader recall net before re-ranking/trimming to TOP_K_FINAL
@@ -131,13 +133,36 @@ def significant_tokens(text: str, min_len: int = 3) -> set:
     return {tok for tok in text.split() if len(tok) >= min_len and tok not in STOPWORDS}
 
 
+def extract_postal_code(addr: str, country: str) -> str:
+    if not isinstance(addr, str) or not addr:
+        return ""
+    c = str(country).lower().strip()
+    if c == "india":
+        m = re.search(r"\b[1-9]\d{5}\b", addr)
+        return m.group(0) if m else ""
+    elif c in ("us", "france"):
+        m = re.search(r"\b\d{5}\b", addr)
+        return m.group(0) if m else ""
+    else:
+        m = re.search(r"\b\d{4,6}\b", addr)
+        return m.group(0) if m else ""
+
+
+def extract_numeric_tokens(text: str) -> set:
+    if not isinstance(text, str) or not text:
+        return set()
+    return set(re.findall(r"\b\d+\b", text))
+
+
 def load_and_normalize(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False)
+    df["country_norm"] = df["country"].astype(str).str.strip().str.lower()
     df["norm_name"] = df["business_name"].apply(normalize_name)
     df["norm_addr"] = df["business_address"].apply(normalize_address)
     df["name_tokens"] = df["norm_name"].apply(significant_tokens)
     df["addr_tokens"] = df["norm_addr"].apply(significant_tokens)
-    df["country_norm"] = df["country"].astype(str).str.strip().str.lower()
+    df["postal_code"] = [extract_postal_code(a, c) for a, c in zip(df["business_address"], df["country_norm"])]
+    df["num_tokens"] = df["business_address"].apply(extract_numeric_tokens)
     df["embed_text"] = (df["norm_name"] + " " + df["norm_addr"]).str.strip()
     return df
 
@@ -155,10 +180,18 @@ def load_embedder(model_name: str = EMBED_MODEL_NAME):
     return SentenceTransformer(model_name)
 
 
-def encode(model, texts, batch_size=256):
+def encode(model, texts, batch_size=128):
+    if len(texts) == 0:
+        dim = getattr(model, "get_sentence_embedding_dimension", lambda: 384)()
+        return np.empty((0, dim), dtype=np.float32)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        model.to(device)
+    except Exception:
+        pass
     vecs = model.encode(
-        list(texts), batch_size=batch_size, show_progress_bar=True,
-        normalize_embeddings=True,  # unit-norm -> dot product == cosine similarity
+        list(texts), batch_size=batch_size, show_progress_bar=False,
+        normalize_embeddings=True, convert_to_numpy=True
     )
     return np.asarray(vecs, dtype=np.float32)
 
@@ -194,27 +227,30 @@ def rare_token_backstop(s1: pd.DataFrame, others: pd.DataFrame, max_frac=RARE_TO
     return result
 
 
-def generate_candidates(s1: pd.DataFrame, others: pd.DataFrame, embedder) -> pd.DataFrame:
-    s1_vecs = encode(embedder, s1["embed_text"])
-    other_vecs = encode(embedder, others["embed_text"])
-    other_ids = others["entity_id"].values
+def generate_candidates_partition(s1_part: pd.DataFrame, others_part: pd.DataFrame, embedder) -> list:
+    """Generate candidate pairs within a single country partition."""
+    if len(s1_part) == 0 or len(others_part) == 0:
+        return []
+
+    s1_vecs = encode(embedder, s1_part["embed_text"])
+    other_vecs = encode(embedder, others_part["embed_text"])
+    other_ids = others_part["entity_id"].values
 
     k_broad = min(TOP_K_BROAD, len(other_ids))
     nn = NearestNeighbors(n_neighbors=k_broad, metric="cosine").fit(other_vecs)
     dist, idx = nn.kneighbors(s1_vecs)
     embed_sim = 1 - dist  # cosine distance -> similarity
 
-    token_backstop = rare_token_backstop(s1, others)
+    token_backstop = rare_token_backstop(s1_part, others_part)
     other_pos = {eid: i for i, eid in enumerate(other_ids)}
 
     rows = []
-    for row_i, s1_id in enumerate(s1["entity_id"].values):
+    for row_i, s1_id in enumerate(s1_part["entity_id"].values):
         cand_scores = {}
         for j, sim in zip(idx[row_i], embed_sim[row_i]):
             cand_scores[other_ids[j]] = float(sim)
 
-        # backstop: add rare-token matches even if outside the embedding top-K_BROAD,
-        # scoring them via the already-computed vectors (cheap: one dot product each)
+        # backstop: add rare-token matches even if outside the embedding top-K_BROAD
         for cid in token_backstop.get(s1_id, set()):
             if cid not in cand_scores and cid in other_pos:
                 sim = float(np.dot(s1_vecs[row_i], other_vecs[other_pos[cid]]))
@@ -225,7 +261,36 @@ def generate_candidates(s1: pd.DataFrame, others: pd.DataFrame, embedder) -> pd.
         for cid, sim in kept:
             rows.append((s1_id, cid, sim))
 
-    return pd.DataFrame(rows, columns=["source1_entity_id", "candidate_entity_id", "embed_cos"])
+    del s1_vecs, other_vecs, nn
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return rows
+
+
+def generate_candidates(s1: pd.DataFrame, others: pd.DataFrame, embedder) -> pd.DataFrame:
+    """
+    Generate candidates partitioned dynamically by country.
+    Entities in one country are only compared against entities from that country.
+    Handles any set of countries dynamically (e.g. US, India, France).
+    """
+    all_rows = []
+    countries = sorted(s1["country_norm"].unique())
+    print(f"Partitioning blocking across {len(countries)} country partition(s): {countries}")
+
+    for country in countries:
+        s1_c = s1[s1["country_norm"] == country]
+        others_c = others[others["country_norm"] == country]
+        c_label = country if country else "<empty/unspecified>"
+        print(f"  [Country: {c_label}] S1={len(s1_c)}, Others={len(others_c)}")
+        if len(others_c) == 0:
+            print(f"  Warning: No candidate records in Others for country {c_label!r}")
+            continue
+
+        c_rows = generate_candidates_partition(s1_c, others_c, embedder)
+        all_rows.extend(c_rows)
+
+    return pd.DataFrame(all_rows, columns=["source1_entity_id", "candidate_entity_id", "embed_cos"])
 
 
 # --------------------------------------------------------------------------
@@ -267,6 +332,15 @@ def build_features(pairs: pd.DataFrame, s1: pd.DataFrame, others: pd.DataFrame,
     feats["name_len_diff"] = (a["norm_name"].str.len() - b["norm_name"].str.len()).abs()
     feats["common_name_tokens"] = [len(x & y) for x, y in zip(a["name_tokens"], b["name_tokens"])]
 
+    def postal_cmp(p1, p2):
+        if not p1 or not p2:
+            return 0.0
+        return 1.0 if p1 == p2 else -1.0
+
+    feats["postal_match"] = [postal_cmp(p1, p2) for p1, p2 in zip(a["postal_code"], b["postal_code"])]
+    feats["num_token_jaccard"] = [jaccard(x, y) for x, y in zip(a["num_tokens"], b["num_tokens"])]
+    feats["num_token_overlap"] = [float(len(x & y)) for x, y in zip(a["num_tokens"], b["num_tokens"])]
+
     feats["source1_entity_id"] = pairs["source1_entity_id"].values
     feats["candidate_entity_id"] = pairs["candidate_entity_id"].values
     return feats
@@ -275,6 +349,7 @@ def build_features(pairs: pd.DataFrame, s1: pd.DataFrame, others: pd.DataFrame,
 FEATURE_COLS = [
     "embed_cos", "name_tfidf_cos", "addr_tfidf_cos", "name_jaccard", "addr_jaccard",
     "name_lev", "addr_lev", "country_match", "name_len_diff", "common_name_tokens",
+    "postal_match", "num_token_jaccard", "num_token_overlap",
 ]
 
 
@@ -311,19 +386,37 @@ def macro_f05(predictions: dict, gt: dict, all_s1_ids) -> float:
     return float(np.mean(scores))
 
 
-def tune_threshold(feat_df: pd.DataFrame, probs: np.ndarray, gt: dict, all_s1_ids, grid=None):
+def tune_threshold(feat_df: pd.DataFrame, probs: np.ndarray, gt: dict, all_s1_ids, grid=None,
+                   singleton_adjust=True, match_weight=0.94415, singleton_weight=0.05585):
     if grid is None:
         grid = np.arange(0.05, 0.96, 0.05)
+    matched_ids = [eid for eid in all_s1_ids if gt.get(eid)]
+    singleton_ids = [eid for eid in all_s1_ids if not gt.get(eid)]
+
     best_thr, best_score = 0.5, -1
+    best_stats = {}
+
     for thr in grid:
         preds = defaultdict(set)
         for s1, cand, p in zip(feat_df["source1_entity_id"], feat_df["candidate_entity_id"], probs):
             if p >= thr:
                 preds[s1].add(cand)
-        score = macro_f05(preds, gt, all_s1_ids)
-        if score > best_score:
-            best_score, best_thr = score, thr
-    return best_thr, best_score
+        raw_score = macro_f05(preds, gt, all_s1_ids)
+        f05_matched = macro_f05(preds, gt, matched_ids) if matched_ids else 0.0
+        f05_singleton = macro_f05(preds, gt, singleton_ids) if singleton_ids else 1.0
+        adj_score = match_weight * f05_matched + singleton_weight * f05_singleton
+
+        opt_score = adj_score if singleton_adjust else raw_score
+        if opt_score > best_score:
+            best_score = opt_score
+            best_thr = thr
+            best_stats = {
+                "raw_f05": raw_score,
+                "matched_f05": f05_matched,
+                "singleton_f05": f05_singleton,
+                "singleton_adj_f05": adj_score,
+            }
+    return best_thr, best_score, best_stats
 
 
 # --------------------------------------------------------------------------
@@ -336,7 +429,8 @@ def train(data_dir: Path, out_dir: Path):
     s3 = load_and_normalize(data_dir / "train_source3.tsv")
     others = pd.concat([s2, s3], ignore_index=True)
     gt = load_ground_truth(data_dir / "train_ground_truth.tsv")
-    print(f"S1={len(s1)} S2={len(s2)} S3={len(s3)}")
+    total_recs = len(s1) + len(s2) + len(s3)
+    print(f"Total records processed: S1={len(s1)}, S2={len(s2)}, S3={len(s3)} (Total={total_recs:,})")
 
     embedder = load_embedder()
     candidates = generate_candidates(s1, others, embedder)
@@ -347,7 +441,17 @@ def train(data_dir: Path, out_dir: Path):
     blocked_pairs = set(zip(candidates["source1_entity_id"], candidates["candidate_entity_id"]))
     missed = all_true_pairs - blocked_pairs
     recall_ceiling = 1 - len(missed) / max(len(all_true_pairs), 1)
-    print(f"Blocking recall ceiling: {recall_ceiling:.4f} ({len(missed)} true pairs missed)")
+    print(f"Blocking recall ceiling (OVERALL): {recall_ceiling:.4f} ({len(missed)} true pairs missed / {len(all_true_pairs)} total)")
+
+    s1_country = dict(zip(s1["entity_id"], s1["country_norm"]))
+    for c in sorted(s1["country_norm"].unique()):
+        c_true = {p for p in all_true_pairs if s1_country.get(p[0]) == c}
+        c_blocked = {p for p in blocked_pairs if s1_country.get(p[0]) == c}
+        c_missed = c_true - c_blocked
+        c_rec = 1 - len(c_missed) / max(len(c_true), 1)
+        c_label = c.upper() if c else "<EMPTY>"
+        print(f"  Recall ceiling [{c_label}]: {c_rec:.4f} ({len(c_missed)} missed / {len(c_true)} true)")
+
     if recall_ceiling < 0.9:
         print("WARNING: raise TOP_K_FINAL/TOP_K_BROAD or lower MIN_SIM — you're losing true "
               "matches before the classifier ever sees them.")
@@ -367,7 +471,7 @@ def train(data_dir: Path, out_dir: Path):
 
     if HAS_LGB:
         model = lgb.LGBMClassifier(n_estimators=300, learning_rate=0.05, num_leaves=31,
-                                    class_weight="balanced", random_state=42)
+                                    class_weight="balanced", random_state=42, verbose=-1)
     else:
         model = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05,
                                                 class_weight="balanced", random_state=42)
@@ -375,14 +479,20 @@ def train(data_dir: Path, out_dir: Path):
 
     val_probs = model.predict_proba(X_val)[:, 1]
     val_s1_ids = list(val_feats["source1_entity_id"].unique())
-    best_thr, best_score = tune_threshold(val_feats, val_probs, gt, val_s1_ids)
-    print(f"Best threshold: {best_thr:.2f}  ->  validation macro F0.5: {best_score:.4f}")
+    best_thr, best_score, val_stats = tune_threshold(val_feats, val_probs, gt, val_s1_ids)
+    print(f"Best threshold: {best_thr:.2f}")
+    print(f"  Raw validation macro F0.5: {val_stats['raw_f05']:.4f}")
+    print(f"  Validation macro F0.5 (matched entities): {val_stats['matched_f05']:.4f}")
+    print(f"  Validation macro F0.5 (singleton entities): {val_stats['singleton_f05']:.4f}")
+    print(f"  Singleton-adjusted validation macro F0.5 (94.4%/5.6% weighted): {val_stats['singleton_adj_f05']:.4f}")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / "model.pkl", "wb") as f:
         pickle.dump({"model": model, "name_vec": name_vec, "addr_vec": addr_vec,
-                     "threshold": best_thr, "embed_model_name": EMBED_MODEL_NAME}, f)
+                     "threshold": best_thr, "embed_model_name": EMBED_MODEL_NAME,
+                     "val_stats": val_stats}, f)
     print(f"Saved model to {out_dir / 'model.pkl'}")
+
 
 
 # --------------------------------------------------------------------------
@@ -401,6 +511,8 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path):
     s2 = load_and_normalize(test_dir / "test_source2.tsv")
     s3 = load_and_normalize(test_dir / "test_source3.tsv")
     others = pd.concat([s2, s3], ignore_index=True)
+    total_recs = len(s1) + len(s2) + len(s3)
+    print(f"Total test records processed: S1={len(s1)}, S2={len(s2)}, S3={len(s3)} (Total={total_recs:,})")
 
     candidates = generate_candidates(s1, others, embedder)
     feats = build_features(candidates, s1, others, name_vec, addr_vec)
