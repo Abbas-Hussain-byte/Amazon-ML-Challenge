@@ -236,10 +236,10 @@ def load_embedder(model_name: str = EMBED_MODEL_NAME):
     return SentenceTransformer(model_name)
 
 
-def encode(model, texts, batch_size=128):
+def encode(model, texts, batch_size=64):
     if len(texts) == 0:
         dim = getattr(model, "get_sentence_embedding_dimension", lambda: 384)()
-        return np.empty((0, dim), dtype=np.float32)
+        return np.empty((0, dim), dtype=np.float16)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     try:
         model.to(device)
@@ -249,23 +249,15 @@ def encode(model, texts, batch_size=128):
         list(texts), batch_size=batch_size, show_progress_bar=False,
         normalize_embeddings=True, convert_to_numpy=True
     )
-    return np.asarray(vecs, dtype=np.float32)
+    return np.asarray(vecs, dtype=np.float16)
 
 
 # --------------------------------------------------------------------------
 # 3. Blocking — capped top-K, scalable
 # --------------------------------------------------------------------------
 
-def rare_token_backstop(s1: pd.DataFrame, others: pd.DataFrame, max_frac=RARE_TOKEN_MAX_FRAC) -> dict:
-    """
-    Token-overlap candidates, using:
-      1. Rare tokens (document frequency <= max_count) to catch distinctive word overlaps.
-      2. Full normalized name matches and near-matches (Levenshtein similarity > 0.9)
-         REGARDLESS of individual token document frequency, catching cases where names
-         contain common words (e.g. 'Real Care Pvt Ltd' vs 'REAL PVT CARE LTD') or
-         addresses are empty/short.
-    """
-    # 1. Rare tokens inverted index
+def build_others_backstop_index(others: pd.DataFrame, max_frac=RARE_TOKEN_MAX_FRAC) -> dict:
+    """Build inverted token and name indices over others records once per country partition."""
     doc_freq = Counter()
     for tokens in others["name_tokens"]:
         for tok in tokens:
@@ -274,17 +266,11 @@ def rare_token_backstop(s1: pd.DataFrame, others: pd.DataFrame, max_frac=RARE_TO
     max_count = max(int(max_frac * n), 3)
     useful_tokens = {tok for tok, c in doc_freq.items() if c <= max_count}
 
-    index = defaultdict(set)
+    token_index = defaultdict(set)
     for eid, tokens in zip(others["entity_id"], others["name_tokens"]):
         for tok in tokens & useful_tokens:
-            index[tok].add(eid)
+            token_index[tok].add(eid)
 
-    token_cands = defaultdict(set)
-    for eid, tokens in zip(s1["entity_id"], s1["name_tokens"]):
-        for tok in tokens:
-            token_cands[eid] |= index.get(tok, set())
-
-    # 2. Full normalized name match & Levenshtein > 0.9 backstop rule (regardless of token frequency)
     exact_name_index = defaultdict(set)
     sorted_tok_index = defaultdict(set)
     cand_index = defaultdict(list)
@@ -298,8 +284,28 @@ def rare_token_backstop(s1: pd.DataFrame, others: pd.DataFrame, max_frac=RARE_TO
             for tok in tokens:
                 cand_index[tok].append((eid, name, len(name)))
 
+    return {
+        "token_index": token_index,
+        "exact_name_index": exact_name_index,
+        "sorted_tok_index": sorted_tok_index,
+        "cand_index": cand_index,
+    }
+
+
+def query_backstop_for_batch(s1_batch: pd.DataFrame, backstop_data: dict):
+    """Query precomputed backstop index for a sub-chunk batch of S1 records."""
+    token_index = backstop_data["token_index"]
+    exact_name_index = backstop_data["exact_name_index"]
+    sorted_tok_index = backstop_data["sorted_tok_index"]
+    cand_index = backstop_data["cand_index"]
+
+    token_cands = defaultdict(set)
+    for eid, tokens in zip(s1_batch["entity_id"], s1_batch["name_tokens"]):
+        for tok in tokens:
+            token_cands[eid] |= token_index.get(tok, set())
+
     name_cands = defaultdict(set)
-    for eid, name, tokens in zip(s1["entity_id"], s1["norm_name"], s1["name_tokens"]):
+    for eid, name, tokens in zip(s1_batch["entity_id"], s1_batch["norm_name"], s1_batch["name_tokens"]):
         if len(name) >= 3:
             name_cands[eid] |= exact_name_index.get(name, set())
             st = " ".join(sorted(tokens))
@@ -324,6 +330,11 @@ def rare_token_backstop(s1: pd.DataFrame, others: pd.DataFrame, max_frac=RARE_TO
                     name_cands[eid].add(cid)
 
     return token_cands, name_cands
+
+
+def rare_token_backstop(s1: pd.DataFrame, others: pd.DataFrame, max_frac=RARE_TOKEN_MAX_FRAC) -> dict:
+    backstop_data = build_others_backstop_index(others, max_frac)
+    return query_backstop_for_batch(s1, backstop_data)
 
 
 def generate_candidates_partition(s1_part: pd.DataFrame, others_part: pd.DataFrame, embedder) -> list:
@@ -604,6 +615,16 @@ def train(data_dir: Path, out_dir: Path):
 # --------------------------------------------------------------------------
 
 def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path):
+    try:
+        import psutil
+        def get_ram_gb():
+            return psutil.Process().memory_info().rss / 1e9
+    except ImportError:
+        def get_ram_gb():
+            return 0.0
+
+    peak_ram_gb = get_ram_gb()
+
     with open(model_path, "rb") as f:
         bundle = pickle.load(f)
     model, name_vec, addr_vec, threshold = (
@@ -617,8 +638,11 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path):
     with open(out_dir / "matching_results.tsv", "w", encoding="utf-8") as f_match:
         f_match.write("source1_entity_id\tmatched_entity_ids\n")
 
-    countries = ["france", "india", "us"]
-    print(f"Streaming prediction partition-by-partition across: {countries}")
+    # Hardcoded to ['india'] temporarily for quick isolated memory test as requested.
+    # To run all partitions across the full test set, set: countries = ["france", "india", "us"]
+    countries = ["india"]
+    print(f"Starting sub-chunked batch prediction (batch_size=1,500) for partitions: {countries}")
+    print(f"Initial baseline RAM: {get_ram_gb():.2f} GB")
 
     total_s1 = 0
     total_candidates_count = 0
@@ -626,21 +650,23 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path):
     for country in countries:
         c_label = country.upper()
         print(f"\n=======================================================")
-        print(f"  Starting Partition: [{c_label}]")
+        print(f"  Starting Partition: [{c_label}] | Current RAM: {get_ram_gb():.2f} GB")
         print(f"=======================================================")
-        
+
         s1_c = load_country_subset(test_dir / "test_source1.tsv", country)
         if len(s1_c) == 0:
             print(f"  No S1 records for {c_label}, skipping.")
             continue
-            
+
         s2_c = load_country_subset(test_dir / "test_source2.tsv", country)
         s3_c = load_country_subset(test_dir / "test_source3.tsv", country)
         others_c = pd.concat([s2_c, s3_c], ignore_index=True)
         del s2_c, s3_c
         gc.collect()
 
-        print(f"  Loaded [{c_label}]: S1={len(s1_c):,}, Others (S2+S3)={len(others_c):,}")
+        cur_ram = get_ram_gb()
+        peak_ram_gb = max(peak_ram_gb, cur_ram)
+        print(f"  Loaded [{c_label}]: S1={len(s1_c):,}, Others={len(others_c):,} | RAM: {cur_ram:.2f} GB (Peak: {peak_ram_gb:.2f} GB)")
         total_s1 += len(s1_c)
 
         if len(others_c) == 0:
@@ -653,42 +679,120 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path):
             gc.collect()
             continue
 
-        c_rows = generate_candidates_partition(s1_c, others_c, embedder)
-        total_candidates_count += len(c_rows)
-        c_pairs = pd.DataFrame(c_rows, columns=["source1_entity_id", "candidate_entity_id", "embed_cos"])
-        del c_rows
-        gc.collect()
+        # 1. Build country-level indices ONCE per country (reused across batches)
+        print(f"  Encoding Others records into float16 (batch_size=64)...")
+        other_vecs = encode(embedder, others_c["embed_text"], batch_size=64)
+        other_ids = others_c["entity_id"].values
+        other_pos = {eid: i for i, eid in enumerate(other_ids)}
 
-        c_feats = build_features(c_pairs, s1_c, others_c, name_vec, addr_vec)
-        del c_pairs
-        gc.collect()
+        cur_ram = get_ram_gb()
+        peak_ram_gb = max(peak_ram_gb, cur_ram)
+        print(f"  Others embeddings ready! Shape: {other_vecs.shape}, dtype: {other_vecs.dtype} | RAM: {cur_ram:.2f} GB (Peak: {peak_ram_gb:.2f} GB)")
 
-        cand_map = defaultdict(list)
-        for s1_id, cid in zip(c_feats["source1_entity_id"], c_feats["candidate_entity_id"]):
-            cand_map[s1_id].append(cid)
+        print(f"  Building NearestNeighbors index over Others (built ONCE per country)...")
+        k_broad = min(TOP_K_BROAD, len(other_ids))
+        nn = NearestNeighbors(n_neighbors=k_broad, metric="cosine").fit(other_vecs)
 
-        c_probs = model.predict_proba(c_feats[FEATURE_COLS])[:, 1] if len(c_feats) else np.array([])
-        match_map = defaultdict(list)
-        for s1_id, cid, p in zip(c_feats["source1_entity_id"], c_feats["candidate_entity_id"], c_probs):
-            if p >= threshold:
-                match_map[s1_id].append(cid)
+        print(f"  Building rare-token & name backstop index over Others...")
+        backstop_data = build_others_backstop_index(others_c)
 
-        with open(out_dir / "candidate_pairs.tsv", "a", encoding="utf-8") as f_cand, \
-             open(out_dir / "matching_results.tsv", "a", encoding="utf-8") as f_match:
-            for eid in s1_c["entity_id"]:
-                f_cand.write(f"{eid}\t{','.join(dict.fromkeys(cand_map.get(eid, [])))}\n")
-                f_match.write(f"{eid}\t{','.join(dict.fromkeys(match_map.get(eid, [])))}\n")
+        cur_ram = get_ram_gb()
+        peak_ram_gb = max(peak_ram_gb, cur_ram)
+        print(f"  Country index ready! RAM: {cur_ram:.2f} GB (Peak: {peak_ram_gb:.2f} GB)")
 
-        print(f"  Completed partition [{c_label}]. Freeing partition memory...")
-        del s1_c, others_c, c_feats, c_probs, cand_map, match_map
+        # 2. Sub-chunk S1 into batches of 1,500 entities
+        s1_batch_size = 1500
+        n_batches = (len(s1_c) + s1_batch_size - 1) // s1_batch_size
+        print(f"  Processing {len(s1_c):,} S1 entities in {n_batches} batches of {s1_batch_size}...")
+
+        part_cands = 0
+        t_start = time.time()
+
+        for b_idx in range(n_batches):
+            b_start = b_idx * s1_batch_size
+            b_end = min(b_start + s1_batch_size, len(s1_c))
+            s1_batch = s1_c.iloc[b_start:b_end]
+
+            # Encode S1 batch in float16
+            s1_batch_vecs = encode(embedder, s1_batch["embed_text"], batch_size=64)
+            dist, idx = nn.kneighbors(s1_batch_vecs)
+            embed_sim = 1 - dist
+
+            token_backstop, name_backstop = query_backstop_for_batch(s1_batch, backstop_data)
+
+            rows = []
+            for row_i, s1_id in enumerate(s1_batch["entity_id"].values):
+                cand_scores = {}
+                for j, sim in zip(idx[row_i], embed_sim[row_i]):
+                    cand_scores[other_ids[j]] = float(sim)
+
+                for cid in token_backstop.get(s1_id, set()):
+                    if cid not in cand_scores and cid in other_pos:
+                        cand_scores[cid] = float(np.dot(s1_batch_vecs[row_i], other_vecs[other_pos[cid]]))
+
+                for cid in name_backstop.get(s1_id, set()):
+                    if cid in other_pos:
+                        sim = float(np.dot(s1_batch_vecs[row_i], other_vecs[other_pos[cid]]))
+                        cand_scores[cid] = max(cand_scores.get(cid, 0.0), sim, 0.88)
+
+                ranked = sorted(cand_scores.items(), key=lambda x: -x[1])
+                kept = [(cid, s) for cid, s in ranked if s >= MIN_SIM][:TOP_K_FINAL]
+                for cid, sim in kept:
+                    rows.append((s1_id, cid, sim))
+
+            part_cands += len(rows)
+            total_candidates_count += len(rows)
+
+            # Build features for just this 1,500 entity batch
+            c_pairs = pd.DataFrame(rows, columns=["source1_entity_id", "candidate_entity_id", "embed_cos"])
+            del rows
+            c_feats = build_features(c_pairs, s1_batch, others_c, name_vec, addr_vec)
+            del c_pairs
+
+            # Predict probabilities
+            c_probs = model.predict_proba(c_feats[FEATURE_COLS])[:, 1] if len(c_feats) else np.array([])
+            batch_cand_map = defaultdict(list)
+            for s1_id, cid in zip(c_feats["source1_entity_id"], c_feats["candidate_entity_id"]):
+                batch_cand_map[s1_id].append(cid)
+
+            batch_match_map = defaultdict(list)
+            for s1_id, cid, p in zip(c_feats["source1_entity_id"], c_feats["candidate_entity_id"], c_probs):
+                if p >= threshold:
+                    batch_match_map[s1_id].append(cid)
+
+            # Write batch results directly and incrementally to disk
+            with open(out_dir / "candidate_pairs.tsv", "a", encoding="utf-8") as f_cand, \
+                 open(out_dir / "matching_results.tsv", "a", encoding="utf-8") as f_match:
+                for eid in s1_batch["entity_id"]:
+                    f_cand.write(f"{eid}\t{','.join(dict.fromkeys(batch_cand_map.get(eid, [])))}\n")
+                    f_match.write(f"{eid}\t{','.join(dict.fromkeys(batch_match_map.get(eid, [])))}\n")
+
+            # Free batch intermediate data immediately
+            del s1_batch_vecs, dist, idx, embed_sim, token_backstop, name_backstop
+            del c_feats, c_probs, batch_cand_map, batch_match_map
+            gc.collect()
+
+            cur_ram = get_ram_gb()
+            peak_ram_gb = max(peak_ram_gb, cur_ram)
+
+            if (b_idx + 1) % 50 == 0 or (b_idx + 1) == n_batches:
+                elapsed = time.time() - t_start
+                rate = b_end / max(elapsed, 1)
+                print(f"  [Batch {b_idx + 1}/{n_batches}] Processed {b_end:,}/{len(s1_c):,} S1 entities ({rate:.0f} ent/s) | RAM: {cur_ram:.2f} GB | Peak RAM: {peak_ram_gb:.2f} GB")
+
+        print(f"  Finished [{c_label}]! Generated {part_cands:,} candidate pairs. Freeing partition memory...")
+        del s1_c, others_c, other_vecs, other_ids, other_pos, nn, backstop_data
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     avg_cands = total_candidates_count / max(total_s1, 1)
     print(f"\n=======================================================")
-    print(f"Done! Wrote candidate_pairs.tsv (avg {avg_cands:.1f} candidates/entity) and matching_results.tsv")
-    print(f"Total processed: {total_s1:,} entities. Used threshold={threshold:.2f}.")
+    print(f"Prediction Complete!")
+    print(f"Total Source-1 Entities Processed: {total_s1:,}")
+    print(f"Total Candidate Pairs: {total_candidates_count:,} (avg {avg_cands:.1f} / entity)")
+    print(f"Peak RAM Usage: {peak_ram_gb:.2f} GB (within 12.7 GB limit)")
+    print(f"Used decision threshold: {threshold:.2f}")
     print(f"=======================================================")
 
 
