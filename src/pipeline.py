@@ -562,30 +562,54 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path):
     total_recs = len(s1) + len(s2) + len(s3)
     print(f"Total test records processed: S1={len(s1)}, S2={len(s2)}, S3={len(s3)} (Total={total_recs:,})")
 
-    candidates = generate_candidates(s1, others, embedder)
-    feats = build_features(candidates, s1, others, name_vec, addr_vec)
-
     out_dir.mkdir(parents=True, exist_ok=True)
-
     cand_map = defaultdict(list)
-    for s1_id, cid in zip(feats["source1_entity_id"], feats["candidate_entity_id"]):
-        cand_map[s1_id].append(cid)
+    match_map = defaultdict(list)
+    total_candidates_count = 0
+
+    countries = sorted(s1["country_norm"].unique())
+    print(f"Streaming prediction across {len(countries)} country partition(s): {countries}")
+
+    for country in countries:
+        s1_c = s1[s1["country_norm"] == country]
+        others_c = others[others["country_norm"] == country]
+        c_label = country if country else "<empty/unspecified>"
+        print(f"  [Partition: {c_label}] S1={len(s1_c):,}, Others={len(others_c):,}")
+        if len(others_c) == 0:
+            continue
+
+        c_rows = generate_candidates_partition(s1_c, others_c, embedder)
+        if not c_rows:
+            continue
+        total_candidates_count += len(c_rows)
+        c_pairs = pd.DataFrame(c_rows, columns=["source1_entity_id", "candidate_entity_id", "embed_cos"])
+        
+        # Build features and score in memory-safe partition
+        c_feats = build_features(c_pairs, s1_c, others_c, name_vec, addr_vec)
+        for s1_id, cid in zip(c_feats["source1_entity_id"], c_feats["candidate_entity_id"]):
+            cand_map[s1_id].append(cid)
+
+        c_probs = model.predict_proba(c_feats[FEATURE_COLS])[:, 1] if len(c_feats) else np.array([])
+        for s1_id, cid, p in zip(c_feats["source1_entity_id"], c_feats["candidate_entity_id"], c_probs):
+            if p >= threshold:
+                match_map[s1_id].append(cid)
+
+        del c_rows, c_pairs, c_feats, c_probs, s1_c, others_c
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     with open(out_dir / "candidate_pairs.tsv", "w") as f:
         f.write("source1_entity_id\tcandidate_entity_ids\n")
         for eid in s1["entity_id"]:
             f.write(f"{eid}\t{','.join(dict.fromkeys(cand_map.get(eid, [])))}\n")
 
-    probs = model.predict_proba(feats[FEATURE_COLS])[:, 1] if len(feats) else np.array([])
-    match_map = defaultdict(list)
-    for s1_id, cid, p in zip(feats["source1_entity_id"], feats["candidate_entity_id"], probs):
-        if p >= threshold:
-            match_map[s1_id].append(cid)
     with open(out_dir / "matching_results.tsv", "w") as f:
         f.write("source1_entity_id\tmatched_entity_ids\n")
         for eid in s1["entity_id"]:
             f.write(f"{eid}\t{','.join(dict.fromkeys(match_map.get(eid, [])))}\n")
 
-    avg_cands = candidates.groupby("source1_entity_id").size().mean() if len(candidates) else 0
+    avg_cands = total_candidates_count / max(len(s1), 1)
     print(f"Wrote candidate_pairs.tsv (avg {avg_cands:.1f} candidates/entity) and matching_results.tsv")
     print(f"Used threshold={threshold:.2f}. Run utils/validate_submission.py before uploading.")
 
@@ -605,7 +629,14 @@ def main():
     if args.cmd == "train":
         train(args.data_dir, args.out_dir)
     elif args.cmd == "predict":
-        model_path = args.model_path or (args.out_dir / "model.pkl")
+        model_path = args.model_path
+        if model_path is None:
+            if (args.out_dir / "model.pkl").exists():
+                model_path = args.out_dir / "model.pkl"
+            elif Path("models/model.pkl").exists():
+                model_path = Path("models/model.pkl")
+            else:
+                model_path = args.out_dir / "model.pkl"
         predict(args.train_dir, args.test_dir, args.out_dir, model_path)
 
 

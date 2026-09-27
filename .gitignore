@@ -18,8 +18,10 @@ dataset/
 data/
 
 # Model checkpoints & serialized weights
-models/
+models/*
+!models/model.pkl
 *.pkl
+!models/model.pkl
 *.pickle
 *.pt
 *.pth
