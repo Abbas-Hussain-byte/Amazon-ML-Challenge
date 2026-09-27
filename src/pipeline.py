@@ -805,6 +805,9 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path, co
             b_end = min(b_start + s1_batch_size, len(s1_c))
             s1_batch = s1_c.iloc[b_start:b_end]
 
+            MAX_TOKEN_CANDS_PER_ENTITY = 200  # cap to prevent O(n²) Levenshtein blowup
+            t_batch = time.time()
+
             # Fast candidate lookup
             s1_cands = defaultdict(set)
             exact_cands = defaultdict(set)
@@ -821,6 +824,8 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path, co
                 for tok in tokens:
                     if tok in token_index:
                         s1_cands[eid].update(token_index[tok])
+                        if len(s1_cands[eid]) > MAX_TOKEN_CANDS_PER_ENTITY:
+                            break  # enough candidates for this entity
 
             raw_cand_eids = list({cid for cids in s1_cands.values() for cid in cids})
 
@@ -941,11 +946,12 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path, co
             cur_ram = get_ram_gb()
             peak_ram_gb = max(peak_ram_gb, cur_ram)
 
-            if (b_idx + 1) % 5 == 0 or (b_idx + 1) == n_batches:
-                elapsed = time.time() - t_start
-                rate = b_end / max(elapsed, 1)
-                pct = (b_idx + 1) / n_batches * 100
-                print(f"  [Batch {b_idx + 1:3d}/{n_batches} ({pct:4.1f}%)] Processed {b_end:,}/{len(s1_c):,} S1 ({rate:.0f} ent/s) | Matches: {part_matches:,} | RAM: {cur_ram:.2f} GB", flush=True)
+            elapsed = time.time() - t_start
+            rate = b_end / max(elapsed, 1)
+            pct = (b_idx + 1) / n_batches * 100
+            b_time = time.time() - t_batch
+            eta_min = (len(s1_c) - b_end) / max(rate, 1) / 60
+            print(f"  [Batch {b_idx + 1:3d}/{n_batches} ({pct:4.1f}%)] {b_end:,}/{len(s1_c):,} S1 ({rate:.0f} ent/s) | batch {b_time:.1f}s | Matches: {part_matches:,} | RAM: {cur_ram:.2f} GB | ETA: {eta_min:.0f}m", flush=True)
 
         print(f"  Finished [{c_label}]! Generated {part_cands:,} candidate pairs, found {part_matches:,} matches.", flush=True)
         conn.close()
