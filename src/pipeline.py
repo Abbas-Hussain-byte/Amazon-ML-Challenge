@@ -807,26 +807,61 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path, co
 
             # Fast candidate lookup
             s1_cands = defaultdict(set)
+            exact_cands = defaultdict(set)
             for eid, name, tokens in zip(s1_batch["entity_id"], s1_batch["norm_name"], s1_batch["name_tokens"]):
                 if name in exact_name_index:
-                    s1_cands[eid].update(exact_name_index[name])
+                    cids = exact_name_index[name]
+                    s1_cands[eid].update(cids)
+                    exact_cands[eid].update(cids)
                 st = " ".join(sorted(tokens))
                 if st in sorted_tok_index:
-                    s1_cands[eid].update(sorted_tok_index[st])
+                    cids = sorted_tok_index[st]
+                    s1_cands[eid].update(cids)
+                    exact_cands[eid].update(cids)
                 for tok in tokens:
                     if tok in token_index:
                         s1_cands[eid].update(token_index[tok])
 
-            all_cand_eids = list({cid for cids in s1_cands.values() for cid in cids})
+            raw_cand_eids = list({cid for cids in s1_cands.values() for cid in cids})
 
             batch_cand_map = defaultdict(list)
             batch_match_map = defaultdict(list)
 
-            if all_cand_eids:
-                # Query candidate records from SQLite
+            if raw_cand_eids:
+                # 1. Fetch candidate norm_name for rapid pre-filtering
+                cand_names = {}
+                for i in range(0, len(raw_cand_eids), 900):
+                    chunk_eids = raw_cand_eids[i:i+900]
+                    q = f"SELECT entity_id, norm_name FROM others WHERE entity_id IN ({','.join('?'*len(chunk_eids))})"
+                    cur.execute(q, chunk_eids)
+                    for eid, name in cur.fetchall():
+                        cand_names[eid] = name
+
+                # 2. Fast pre-filter: Keep top 15 candidates per S1 entity via rapid Levenshtein
+                filtered_s1_cands = {}
+                for eid, s1_name in zip(s1_batch["entity_id"], s1_batch["norm_name"]):
+                    cids = s1_cands.get(eid, set())
+                    if not cids:
+                        continue
+                    e_matches = exact_cands.get(eid, set())
+                    scored = []
+                    for cid in cids:
+                        if cid in e_matches:
+                            scored.append((cid, 1.0))
+                        elif cid in cand_names:
+                            sim = lev_ratio(s1_name, cand_names[cid])
+                            if sim >= 0.25:
+                                scored.append((cid, sim))
+                    scored.sort(key=lambda x: -x[1])
+                    filtered_s1_cands[eid] = [cid for cid, s in scored[:15]]
+
+                top_cand_eids = list({cid for cids in filtered_s1_cands.values() for cid in cids})
+                del cand_names, s1_cands, exact_cands, raw_cand_eids
+
+                # 3. Fetch full records for ONLY the filtered candidates
                 cand_records = {}
-                for i in range(0, len(all_cand_eids), 900):
-                    chunk_eids = all_cand_eids[i:i+900]
+                for i in range(0, len(top_cand_eids), 900):
+                    chunk_eids = top_cand_eids[i:i+900]
                     q = f"SELECT entity_id, norm_name, norm_addr, postal_code, num_tokens, addr_tokens, name_tokens, embed_text FROM others WHERE entity_id IN ({','.join('?'*len(chunk_eids))})"
                     cur.execute(q, chunk_eids)
                     for r in cur.fetchall():
@@ -839,21 +874,21 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path, co
                             "country_norm": country
                         }
 
-                # Encode S1 batch and candidates on GPU
-                valid_cand_eids = [cid for cid in all_cand_eids if cid in cand_records]
+                # 4. Fast GPU encoding with batch_size=256
+                valid_cand_eids = [cid for cid in top_cand_eids if cid in cand_records]
                 cand_texts = [cand_records[cid]["embed_text"] for cid in valid_cand_eids]
-                s1_vecs = encode(embedder, s1_batch["embed_text"], batch_size=64)
+                s1_vecs = encode(embedder, s1_batch["embed_text"], batch_size=256)
 
                 if cand_texts:
-                    cand_vecs = encode(embedder, cand_texts, batch_size=64)
+                    cand_vecs = encode(embedder, cand_texts, batch_size=256)
                     cand_vec_map = {cid: cand_vecs[i] for i, cid in enumerate(valid_cand_eids)}
                 else:
                     cand_vec_map = {}
 
-                # Score pairs
+                # 5. Score pairs
                 pairs = []
                 for row_i, s1_id in enumerate(s1_batch["entity_id"]):
-                    cids = s1_cands.get(s1_id, set())
+                    cids = filtered_s1_cands.get(s1_id, [])
                     if not cids:
                         continue
                     s_vec = s1_vecs[row_i]
@@ -888,7 +923,7 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path, co
 
                 part_cands += len(pairs)
                 total_candidates_count += len(pairs)
-                del pairs, cand_records
+                del pairs, cand_records, filtered_s1_cands, top_cand_eids
 
             # Write batch results directly to disk
             with open(out_dir / "candidate_pairs.tsv", "a", encoding="utf-8") as f_cand, \
@@ -900,16 +935,17 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path, co
                     if matches:
                         part_matches += 1
 
-            del s1_cands, all_cand_eids, batch_cand_map, batch_match_map
+            del batch_cand_map, batch_match_map
             gc.collect()
 
             cur_ram = get_ram_gb()
             peak_ram_gb = max(peak_ram_gb, cur_ram)
 
-            if (b_idx + 1) % 50 == 0 or (b_idx + 1) == n_batches:
+            if (b_idx + 1) % 5 == 0 or (b_idx + 1) == n_batches:
                 elapsed = time.time() - t_start
                 rate = b_end / max(elapsed, 1)
-                print(f"  [Batch {b_idx + 1}/{n_batches}] Processed {b_end:,}/{len(s1_c):,} S1 entities ({rate:.0f} ent/s) | Matches: {part_matches:,} | RAM: {cur_ram:.2f} GB | Peak: {peak_ram_gb:.2f} GB", flush=True)
+                pct = (b_idx + 1) / n_batches * 100
+                print(f"  [Batch {b_idx + 1:3d}/{n_batches} ({pct:4.1f}%)] Processed {b_end:,}/{len(s1_c):,} S1 ({rate:.0f} ent/s) | Matches: {part_matches:,} | RAM: {cur_ram:.2f} GB", flush=True)
 
         print(f"  Finished [{c_label}]! Generated {part_cands:,} candidate pairs, found {part_matches:,} matches.", flush=True)
         conn.close()
