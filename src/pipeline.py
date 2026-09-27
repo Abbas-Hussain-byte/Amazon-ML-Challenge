@@ -181,6 +181,48 @@ def load_and_normalize(path: Path) -> pd.DataFrame:
     return result
 
 
+def load_country_subset(path: Path, country: str, chunksize: int = 250000) -> pd.DataFrame:
+    """Load and normalize only the rows matching a specific country partition in low-memory chunks."""
+    chunks = []
+    for c in pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False, chunksize=chunksize):
+        c_norm = c["country"].astype(str).str.strip().str.lower()
+        sub = c[c_norm == country]
+        if len(sub) > 0:
+            chunks.append(sub)
+    if not chunks:
+        return pd.DataFrame(columns=[
+            "entity_id", "country_norm", "norm_name", "norm_addr",
+            "name_tokens", "addr_tokens", "postal_code", "num_tokens", "embed_text"
+        ])
+    df = pd.concat(chunks, ignore_index=True)
+    del chunks
+    gc.collect()
+
+    country_norm = df["country"].astype(str).str.strip().str.lower()
+    norm_name = df["business_name"].apply(normalize_name)
+    norm_addr = df["business_address"].apply(normalize_address)
+    name_tokens = norm_name.apply(significant_tokens)
+    addr_tokens = norm_addr.apply(significant_tokens)
+    postal_code = [extract_postal_code(a, c) for a, c in zip(df["business_address"], country_norm)]
+    num_tokens = df["business_address"].apply(extract_numeric_tokens)
+    embed_text = (norm_name + " " + norm_addr).str.strip()
+
+    result = pd.DataFrame({
+        "entity_id": df["entity_id"].values,
+        "country_norm": country_norm.values,
+        "norm_name": norm_name.values,
+        "norm_addr": norm_addr.values,
+        "name_tokens": name_tokens.values,
+        "addr_tokens": addr_tokens.values,
+        "postal_code": postal_code,
+        "num_tokens": num_tokens.values,
+        "embed_text": embed_text.values
+    })
+    del df
+    gc.collect()
+    return result
+
+
 # --------------------------------------------------------------------------
 # 2. Local embedding model (offline)
 # --------------------------------------------------------------------------
@@ -569,65 +611,85 @@ def predict(train_dir: Path, test_dir: Path, out_dir: Path, model_path: Path):
     )
     embedder = load_embedder(bundle.get("embed_model_name", EMBED_MODEL_NAME))
 
-    s1 = load_and_normalize(test_dir / "test_source1.tsv")
-    s2 = load_and_normalize(test_dir / "test_source2.tsv")
-    s3 = load_and_normalize(test_dir / "test_source3.tsv")
-    total_recs = len(s1) + len(s2) + len(s3)
-    others = pd.concat([s2, s3], ignore_index=True)
-    del s2, s3
-    gc.collect()
-    print(f"Total test records processed: S1={len(s1)}, Others={len(others)} (Total={total_recs:,})")
-
     out_dir.mkdir(parents=True, exist_ok=True)
-    cand_map = defaultdict(list)
-    match_map = defaultdict(list)
+    with open(out_dir / "candidate_pairs.tsv", "w", encoding="utf-8") as f_cand:
+        f_cand.write("source1_entity_id\tcandidate_entity_ids\n")
+    with open(out_dir / "matching_results.tsv", "w", encoding="utf-8") as f_match:
+        f_match.write("source1_entity_id\tmatched_entity_ids\n")
+
+    countries = ["france", "india", "us"]
+    print(f"Streaming prediction partition-by-partition across: {countries}")
+
+    total_s1 = 0
     total_candidates_count = 0
 
-    countries = sorted(s1["country_norm"].unique())
-    print(f"Streaming prediction across {len(countries)} country partition(s): {countries}")
-
     for country in countries:
-        s1_c = s1[s1["country_norm"] == country]
-        others_c = others[others["country_norm"] == country]
-        c_label = country if country else "<empty/unspecified>"
-        print(f"  [Partition: {c_label}] S1={len(s1_c):,}, Others={len(others_c):,}")
+        c_label = country.upper()
+        print(f"\n=======================================================")
+        print(f"  Starting Partition: [{c_label}]")
+        print(f"=======================================================")
+        
+        s1_c = load_country_subset(test_dir / "test_source1.tsv", country)
+        if len(s1_c) == 0:
+            print(f"  No S1 records for {c_label}, skipping.")
+            continue
+            
+        s2_c = load_country_subset(test_dir / "test_source2.tsv", country)
+        s3_c = load_country_subset(test_dir / "test_source3.tsv", country)
+        others_c = pd.concat([s2_c, s3_c], ignore_index=True)
+        del s2_c, s3_c
+        gc.collect()
+
+        print(f"  Loaded [{c_label}]: S1={len(s1_c):,}, Others (S2+S3)={len(others_c):,}")
+        total_s1 += len(s1_c)
+
         if len(others_c) == 0:
+            with open(out_dir / "candidate_pairs.tsv", "a", encoding="utf-8") as f_cand, \
+                 open(out_dir / "matching_results.tsv", "a", encoding="utf-8") as f_match:
+                for eid in s1_c["entity_id"]:
+                    f_cand.write(f"{eid}\t\n")
+                    f_match.write(f"{eid}\t\n")
+            del s1_c, others_c
+            gc.collect()
             continue
 
         c_rows = generate_candidates_partition(s1_c, others_c, embedder)
-        if not c_rows:
-            continue
         total_candidates_count += len(c_rows)
         c_pairs = pd.DataFrame(c_rows, columns=["source1_entity_id", "candidate_entity_id", "embed_cos"])
-        
-        # Build features and score in memory-safe partition
+        del c_rows
+        gc.collect()
+
         c_feats = build_features(c_pairs, s1_c, others_c, name_vec, addr_vec)
+        del c_pairs
+        gc.collect()
+
+        cand_map = defaultdict(list)
         for s1_id, cid in zip(c_feats["source1_entity_id"], c_feats["candidate_entity_id"]):
             cand_map[s1_id].append(cid)
 
         c_probs = model.predict_proba(c_feats[FEATURE_COLS])[:, 1] if len(c_feats) else np.array([])
+        match_map = defaultdict(list)
         for s1_id, cid, p in zip(c_feats["source1_entity_id"], c_feats["candidate_entity_id"], c_probs):
             if p >= threshold:
                 match_map[s1_id].append(cid)
 
-        del c_rows, c_pairs, c_feats, c_probs, s1_c, others_c
+        with open(out_dir / "candidate_pairs.tsv", "a", encoding="utf-8") as f_cand, \
+             open(out_dir / "matching_results.tsv", "a", encoding="utf-8") as f_match:
+            for eid in s1_c["entity_id"]:
+                f_cand.write(f"{eid}\t{','.join(dict.fromkeys(cand_map.get(eid, [])))}\n")
+                f_match.write(f"{eid}\t{','.join(dict.fromkeys(match_map.get(eid, [])))}\n")
+
+        print(f"  Completed partition [{c_label}]. Freeing partition memory...")
+        del s1_c, others_c, c_feats, c_probs, cand_map, match_map
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    with open(out_dir / "candidate_pairs.tsv", "w") as f:
-        f.write("source1_entity_id\tcandidate_entity_ids\n")
-        for eid in s1["entity_id"]:
-            f.write(f"{eid}\t{','.join(dict.fromkeys(cand_map.get(eid, [])))}\n")
-
-    with open(out_dir / "matching_results.tsv", "w") as f:
-        f.write("source1_entity_id\tmatched_entity_ids\n")
-        for eid in s1["entity_id"]:
-            f.write(f"{eid}\t{','.join(dict.fromkeys(match_map.get(eid, [])))}\n")
-
-    avg_cands = total_candidates_count / max(len(s1), 1)
-    print(f"Wrote candidate_pairs.tsv (avg {avg_cands:.1f} candidates/entity) and matching_results.tsv")
-    print(f"Used threshold={threshold:.2f}. Run utils/validate_submission.py before uploading.")
+    avg_cands = total_candidates_count / max(total_s1, 1)
+    print(f"\n=======================================================")
+    print(f"Done! Wrote candidate_pairs.tsv (avg {avg_cands:.1f} candidates/entity) and matching_results.tsv")
+    print(f"Total processed: {total_s1:,} entities. Used threshold={threshold:.2f}.")
+    print(f"=======================================================")
 
 
 def main():
